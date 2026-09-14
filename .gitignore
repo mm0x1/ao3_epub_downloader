@@ -1,5 +1,8 @@
 downloaded/*
 links/*
 venv/
+__pycache__/
 *.log
+personal.ini
+.env
 !placeholder.txt
