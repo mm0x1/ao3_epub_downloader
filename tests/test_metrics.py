@@ -1,15 +1,17 @@
+"""Tests for local EPUB metrics."""
+
 from pathlib import Path
 import tempfile
 import unittest
 import zipfile
 
-from local_metrics import (
-    LOCAL_METRICS_ALGORITHM,
+from ao3archiver import metrics
+from ao3archiver.metrics import (
     calculate_epub_metrics,
     calculate_text_metrics,
     extract_epub_text,
+    LOCAL_METRICS_ALGORITHM,
 )
-import local_metrics
 
 
 def create_metrics_epub(path: Path, documents: dict[str, str]) -> None:
@@ -54,7 +56,7 @@ class LocalMetricsTest(unittest.TestCase):
         self.assertIsNotNone(tokenized.gfog)
 
     def test_sentence_profile_does_not_split_common_abbreviations_or_decimals(self):
-        sentences = local_metrics._sentences("Dr. Smith used 3.14 words. Next sentence!")
+        sentences = metrics._sentences("Dr. Smith used 3.14 words. Next sentence!")
 
         self.assertEqual(sentences, ("Dr. Smith used 3.14 words.", "Next sentence!"))
 

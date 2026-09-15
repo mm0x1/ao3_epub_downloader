@@ -19,7 +19,6 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 
-
 LOCAL_METRICS_ALGORITHM = "count-pages-compatible-pure-python-v1"
 _WORD_PATTERN = re.compile(r"[^\W_]+(?:['\u2019\u2010\u2011\u2012\u2013\u2014-][^\W_]+)*", re.UNICODE)
 _SENTENCE_ABBREVIATIONS = frozenset({"mr", "mrs", "ms", "dr", "st", "sr", "jr", "etc", "e.g"})

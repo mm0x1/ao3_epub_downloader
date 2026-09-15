@@ -1,3 +1,5 @@
+"""Tests for the download workflow: planning, enrichment, failure records, and full offline runs."""
+
 import io
 import json
 from pathlib import Path
@@ -6,18 +8,23 @@ import unittest
 import xml.etree.ElementTree as ET
 import zipfile
 
-import ao3_metadata
-import download
-import download_client
-from ao3_backfill import AO3FetchRecord, CacheStore
-from run_log import RunInterrupted, configure_logging, register_secret
-from test_download_client import (
+from ao3archiver import ao3_client, download
+from ao3archiver.ao3_client import AO3FetchRecord
+from ao3archiver.metadata import (
+    AO3Metadata,
+    enrich_epub,
+    has_ao3_metadata,
+    read_ao3_metadata,
+    validate_epub_file,
+)
+from ao3archiver.run_log import configure_logging, register_secret, RunInterrupted
+from tests.support import (
     CREDENTIALS,
-    MYSTERY_PAGE,
-    RoutedSession,
     epub_bytes,
     epub_reply,
     html,
+    MYSTERY_PAGE,
+    RoutedSession,
     serve_work,
     sign_in_replies,
     work_page,
@@ -135,14 +142,6 @@ class FailureLogTest(unittest.TestCase):
 
         self.assertNotIn("sekrit-reader", persisted)
 
-    def test_legacy_failures_are_only_counted(self):
-        with tempfile.TemporaryDirectory() as directory:
-            legacy = Path(directory) / "download_errors.log"
-            legacy.write_text("https://archiveofourown.org/works/1\n\nhttps://archiveofourown.org/works/2\n")
-
-            self.assertEqual(download.count_legacy_failures(legacy), 2)
-            self.assertEqual(download.count_legacy_failures(Path(directory) / "missing.log"), 0)
-
 
 class PlanWorkTest(unittest.TestCase):
     def plan(self, directory, work_ids, **options):
@@ -174,7 +173,7 @@ class PlanWorkTest(unittest.TestCase):
             output.mkdir()
             epub = output / "111.epub"
             epub.write_bytes(epub_bytes())
-            metadata = ao3_metadata.AO3Metadata("111", "https://archiveofourown.org/works/111", kudos=5)
+            metadata = AO3Metadata("111", "https://archiveofourown.org/works/111", kudos=5)
             download.enrich_for_calibre(epub, download.with_local_metrics(metadata, epub))
 
             (planned, counts), _ = self.plan(directory, ["111"])
@@ -190,8 +189,8 @@ class PlanWorkTest(unittest.TestCase):
             output.mkdir()
             epub = output / "111.epub"
             epub.write_bytes(epub_bytes())
-            ao3_metadata.enrich_epub(epub, ao3_metadata.AO3Metadata("111", "https://archiveofourown.org/works/111", kudos=5))
-            self.assertTrue(ao3_metadata.has_ao3_metadata(epub))
+            enrich_epub(epub, AO3Metadata("111", "https://archiveofourown.org/works/111", kudos=5))
+            self.assertTrue(has_ao3_metadata(epub))
 
             (planned, _), _ = self.plan(directory, ["111"])
 
@@ -259,7 +258,7 @@ class SaveEpubTest(unittest.TestCase):
 
             download.save_epub_atomically(epub_bytes(), destination)
 
-            ao3_metadata.validate_epub_file(destination)
+            validate_epub_file(destination)
 
 
 class EnrichForCalibreTest(unittest.TestCase):
@@ -267,7 +266,7 @@ class EnrichForCalibreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             epub = Path(directory) / "111.epub"
             epub.write_bytes(epub_bytes())
-            page = download_client.FetchedWorkPage(
+            page = ao3_client.FetchedWorkPage(
                 record=AO3FetchRecord(
                     work_id="111", work_url="https://archiveofourown.org/works/111",
                     fetched_at="2026-01-01T00:00:00+00:00", availability="ok",
@@ -278,7 +277,7 @@ class EnrichForCalibreTest(unittest.TestCase):
 
             download.enrich_for_calibre(epub, metadata)
             columns = calibre_columns(epub)
-            stored = ao3_metadata.read_ao3_metadata(epub)
+            stored = read_ao3_metadata(epub)
 
         self.assertEqual(columns["ao3_kudos"], 68)
         self.assertEqual(columns["ao3_hits"], 1040)
@@ -301,7 +300,7 @@ class RunDownloadsTest(unittest.TestCase):
         self.links.mkdir()
         self.output = self.root / "out"
         self.failure_log = self.root / "failures.jsonl"
-        self.lock = self.root / "ao3-cache.jsonl"
+        self.lock = self.root / "ao3-cache.jsonl.fetch.lock"
         self.session = RoutedSession()
         self.credentials_loaded = 0
 
@@ -314,7 +313,7 @@ class RunDownloadsTest(unittest.TestCase):
 
     def run_downloads(self, **options):
         def factory(credentials, delay, sleep_fn):
-            return download_client.AO3DownloadClient(
+            return ao3_client.AO3DownloadClient(
                 credentials, delay_seconds=delay, sleep_fn=lambda _: None, session=self.session
             )
 
@@ -322,7 +321,6 @@ class RunDownloadsTest(unittest.TestCase):
             self.links,
             self.output,
             failure_log_path=self.failure_log,
-            legacy_failure_log=self.root / "download_errors.log",
             lock_path=self.lock,
             credentials_loader=self.load_credentials,
             client_factory=factory,
@@ -444,8 +442,8 @@ class RunDownloadsTest(unittest.TestCase):
     def test_a_real_run_refuses_to_start_while_another_run_holds_the_account(self):
         write_links(self.links, *links_for("111"))
 
-        with CacheStore(self.lock).fetch_lock():
-            with self.assertRaises(download_client.AnotherRunActive):
+        with ao3_client.account_lock(self.lock):
+            with self.assertRaises(ao3_client.AnotherRunActive):
                 self.run_downloads()
 
         self.assertEqual(self.credentials_loaded, 0)

@@ -20,7 +20,9 @@ import signal
 import sys
 import time
 
-DEFAULT_LOG_DIR = Path.home() / ".local" / "share" / "ao3-calibre-backfill" / "logs"
+from ao3archiver.common import STATE_DIR
+
+DEFAULT_LOG_DIR = STATE_DIR / "logs"
 REDACTED = "<redacted>"
 ROOT_LOGGER_NAME = "ao3"
 MINIMUM_SECRET_LENGTH = 3

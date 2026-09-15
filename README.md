@@ -1,350 +1,347 @@
-A python script to help download works from AO3 in bulk. It takes in a folder full of .txt files and will download every work in those .txt files. It was created as a substitute for Calibre's FanFicFare plugin, which does not work when AO3 is protected with Cloudflare.
+# ao3Archiver
 
-### Prerequisites
-- Python installed on your PC
-- https://github.com/nianeyna/ao3downloader. See the repo instructions for how to get it running. Pay attention to the Python version that you need to run ao3downloader in their README (Python 3.11.4). Once you have ao3downloader running, continue with the steps below.
+Bulk-download works from Archive of Our Own as EPUBs that arrive in Calibre
+with their AO3 statistics already filled in: kudos, hits, bookmarks, comments,
+word count, chapters, status, and category, plus a local word count and Gunning
+Fog readability score calculated from the file itself.
 
-1. 
+It started as a substitute for Calibre's FanFicFare plugin, which cannot get
+past AO3's Cloudflare protection.
 
-### Step 1: Grabbing Links
-Use ao3downloader to grab all work urls from ao3 search result pages.
+- [How it works](#how-it-works)
+- [Setup](#setup)
+- [1. Harvest links](#1-harvest-links)
+- [2. Download](#2-download)
+- [3. Import into Calibre](#3-import-into-calibre)
+- [What goes into each EPUB](#what-goes-into-each-epub)
+- [Backfilling an existing Calibre library](#backfilling-an-existing-calibre-library)
+- [Files outside the repository](#files-outside-the-repository)
+- [Project layout](#project-layout)
+- [Development](#development)
 
-1. clone https://github.com/nianeyna/ao3downloader
-2. `cd ao3downloader`
-3. 
-```
-python -m venv venv
-source venv/bin/activate
+## How it works
+
+1. **Harvest links** with [ao3downloader](https://github.com/nianeyna/ao3downloader):
+   it saves every work link from AO3 search results as `.txt` files.
+2. **Download** with `download.py`. For each link it reads the AO3 work page,
+   downloads the EPUB, and bakes all of the work's metadata into the file.
+3. **Drag the EPUBs into Calibre.** The custom columns fill in on import, with
+   no sync step.
+
+For a library that already holds thousands of AO3 EPUBs, `backfill.py` fills
+the same columns in place, once.
+
+## Setup
+
+**Python 3** (developed and tested on 3.14) with `requests`:
+
+```sh
+git clone <this repository> && cd ao3Archiver
+python3 -m venv venv && source venv/bin/activate   # optional
 pip install -r requirements.txt
 ```
-4. `python ao3downloader.py`
-5. enter option `l: get all work links from an ao3 listing (saves links only)` in the menu
-6. when it asks for an ao3 link, enter the link to your ao3 search results page. Ex. "https://archiveofourown.org/works?commit=Sort+and+Filter&work_search%5Bsort_column%5D=hits&include_work_search%5Brating_ids%5D%5B%5D=10&include_work_search%5Bcategory_ids%5D%5B%5D=23&work_search%5Bother_tag_names%5D=Alternate+Universe&work_search%5Bexcluded_tag_names%5D=&work_search%5Bcrossover%5D=&work_search%5Bcomplete%5D=T&work_search%5Bwords_from%5D=10000&work_search%5Bwords_to%5D=&work_search%5Bdate_from%5D=&work_search%5Bdate_to%5D=&work_search%5Bquery%5D=&work_search%5Blanguage_id%5D=en&tag_id=%EB%B0%A9%ED%83%84%EC%86%8C%EB%85%84%EB%8B%A8+%7C+Bangtan+Boys+%7C+BTS"
-7. if it asks you to login, login if you have an account. You dont need to though.
-8. Keep doing this for various search results
 
-At the end of this process, you should have a bunch of .txt files in ao3downloader/downloads that are filled with work links.
-### Step 2: Downloading Links
-Use the script in this repo to download works in bulk. It requires python. It will take in a folder full of `.txt` files and download them all.
+**AO3 credentials** go in a `.env` file in the repository root. It is ignored by
+Git, and neither tool ever prints or stores the values:
 
-1. clone this repository and cd into it
-2. 
+```sh
+AO3_USERNAME=your-username
+AO3_PASSWORD=your-password
 ```
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+
+`AO3_USERNAME` and `AO3_PASSWORD` in the environment override the file.
+`download.py` also falls back to a `personal.ini` copied from
+`personal.ini.example`; the backfill does not.
+
+**Calibre custom columns** must exist before you import anything. Calibre
+silently drops values for columns a library does not have. Create them once,
+either in *Preferences → Add your own columns* or with
+`backfill.py setup-columns` (see [Backfilling](#backfilling-an-existing-calibre-library)):
+
+| Lookup name | Heading | Type |
+| --- | --- | --- |
+| `ao3_kudos` | AO3 Kudos | Integers |
+| `ao3_hits` | AO3 Hits | Integers |
+| `ao3_bookmarks` | AO3 Bookmarks | Integers |
+| `ao3_comments` | AO3 Comments | Integers |
+| `ao3_words` | AO3 Words | Integers |
+| `ao3_chapters` | AO3 Chapters | Text |
+| `ao3_status` | AO3 Status | Text |
+| `ao3_category` | AO3 Category | Text |
+| `words` | Words | Integers |
+| `gfog` | Gfog | Floating point numbers |
+
+## 1. Harvest links
+
+1. Set up [ao3downloader](https://github.com/nianeyna/ao3downloader) following its
+   README, including the Python version it asks for.
+2. Run `python ao3downloader.py` and choose
+   `l: get all work links from an ao3 listing (saves links only)`.
+3. Paste the URL of an AO3 search results page. Logging in is optional.
+4. Repeat for as many searches as you like.
+
+Copy the resulting `.txt` files from `ao3downloader/downloads` into a `links`
+folder in this repository. Duplicate links across files are fine.
+
+## 2. Download
+
+Preview the plan first, then run it:
+
+```sh
+python3 download.py --dry-run
+python3 download.py
 ```
-3. create a folder named `links` in the same directory as this repository
-4. place all of the txt files from step 1 into the links folder
-5. supply your AO3 credentials in either place. Both files are ignored by Git:
-   - a `.env` file containing `AO3_USERNAME=` and `AO3_PASSWORD=` (preferred), or
-   - a local `personal.ini` copied from `personal.ini.example` (fallback).
-6. `python download.py --dry-run` to see the plan, then `python download.py`
 
-For each work, the script fetches the AO3 work page, downloads the EPUB that the
-page's Download menu links to, calculates local Words and Gunning Fog from the
-file, and writes all of it into the EPUB (see below). Works that are deleted or
-hidden in an unrevealed collection are recorded and skipped without spending a
-download on them.
+The plan shows how many links there are, how many are duplicates, how many are
+already done, and an estimated finish time. Every run after that resumes
+automatically: finished EPUBs are skipped, and half-finished ones are completed.
 
-#### Options
+For each work, the script:
 
-| Flag | Effect |
+1. reads the AO3 work page;
+2. skips the work if AO3 reports it deleted, or hidden in an unrevealed
+   challenge collection ("Mystery Work"), and records that;
+3. downloads the EPUB from the page's own Download link;
+4. calculates local Words and Gunning Fog from the file;
+5. writes everything into the EPUB and reads it back to confirm Calibre will see it.
+
+| Option | Effect |
 | --- | --- |
-| `--dry-run` | Show the plan and the estimated finish time without making any request. |
+| `--dry-run` | Show the plan and estimated finish time; make no requests. |
 | `--limit N` | Process at most N works. Useful for a first run. |
 | `--delay SECONDS` | Seconds between AO3 requests (default 10, minimum 5). A new download costs two paced requests. |
-| `--links DIR` / `--output DIR` | Override `./links` and `./downloaded`. |
+| `--links DIR` / `--output DIR` | Read links from, and save EPUBs to, somewhere other than `links/` and `downloaded/`. |
 | `--metadata-only` | Enrich EPUBs already on disk; download nothing. |
-| `--refresh-metadata` | Re-fetch AO3 statistics even for EPUBs that are already complete. |
-| `--retry-unavailable` | Include works previously found deleted or unrevealed on AO3. |
+| `--refresh-metadata` | Re-read AO3 statistics even for EPUBs that are already complete. |
+| `--retry-unavailable` | Include works previously found deleted or unrevealed. |
 | `--failure-log PATH` | Where failed and unavailable works are recorded. |
-| `--log-dir DIR` | Where to write this run's log file. |
+| `--log-dir DIR` | Where this run's log file goes. |
 
-#### Unattended runs
+### Leaving it running
 
-The script is built to be left running:
+A download of tens of thousands of works takes days, so the script is built to
+run unattended:
 
-- A work that fails is recorded in
-  `~/.local/share/ao3-calibre-backfill/download-failures.jsonl` and the run moves
-  on. Failed works get one more attempt at the end of the run, and any that still
-  fail are retried automatically by the next run.
-- A problem that affects every work (a Cloudflare challenge, repeated rate
-  limiting, a dropped login, several failures in a row) pauses the run — 5, 15,
-  30, then 60 minutes — signs in again, and carries on. AO3's `Retry-After` is
-  always honoured.
-- Rejected credentials stop the run, since retrying them cannot succeed.
-- Only one AO3 run can use the account at a time. `download.py` refuses to start
-  while an `ao3_backfill.py fetch` (or another download) is running.
+- **A work that fails** is recorded and skipped. Failed works get one more try at
+  the end of the run, and the next run tries them again.
+- **A problem that affects every work** — a Cloudflare challenge, repeated rate
+  limiting, a dropped login, or five failures in a row — pauses the run for 5,
+  15, 30, then 60 minutes, signs in again, and carries on. AO3's `Retry-After`
+  is always honoured, and a passing AO3 error (HTTP 5xx, including Cloudflare's
+  525) is simply retried.
+- **Rejected credentials stop the run**, since retrying them cannot succeed.
+- **Only one AO3 run can use the account at a time.** `download.py` refuses to
+  start while a backfill fetch or another download is running.
 
-The old `download_errors.log` is no longer used as a skip list; the plan reports
-how many entries it still holds.
+Every line of output is also written, as it happens, to a timestamped log file,
+so a long run can be started in the background and followed:
 
-#### Progress and logs
-
-Every run prints a plan up front (link count, duplicates, how many are already
-done, and an estimated finish time), then one line per work with a running rate
-and ETA, and a summary every 25 works. The same output is written to a
-timestamped file under `~/.local/share/ao3-calibre-backfill/logs/`, flushed as
-it goes, so a long run can be started with `nohup` and followed with `tail -f`.
-
-Press Ctrl-C to stop at the next safe point; the run prints a summary and exits
-130. Rerunning the same command resumes from what is already on disk.
-
-### Metadata for Calibre and Calibre-Web
-
-The EPUB download endpoint does not put AO3 counters such as kudos, hits,
-bookmarks, or comments in the EPUB package metadata. The counters are visible
-on the AO3 work page, so this project reads that page for each work and adds the
-values to the EPUB.
-
-The values are written in three places:
-
-- The EPUB description contains a visible `AO3 statistics` block.
-- The EPUB contains `ao3:*` metadata and an `ao3` work identifier, a portable
-  record that does not depend on Calibre.
-- The EPUB contains `calibre:user_metadata` entries, so **dragging the file into
-  Calibre populates the custom columns directly** with no separate sync step.
-
-The columns filled on import are `#ao3_kudos`, `#ao3_hits`, `#ao3_bookmarks`,
-`#ao3_comments`, `#ao3_words`, `#ao3_chapters`, `#ao3_status`, `#ao3_category`,
-plus `#words` and `#gfog` calculated from the downloaded file. Calibre only
-fills columns that **already exist** in the target library, and silently ignores
-the rest, so create them first (see the backfill section's `setup-columns`, or
-add them in Calibre's Preferences).
-
-New downloads are enriched automatically. To enrich EPUBs that were downloaded
-before this feature was added, run:
-
-```text
-python download.py --metadata-only
+```sh
+nohup python3 download.py &
+tail -f "$(ls -t ~/.local/share/ao3-calibre-backfill/logs/download-*.log | head -1)"
 ```
 
-This skips EPUBs that are already complete, meaning they carry both the `ao3:*`
-metadata and the Calibre column values; files enriched by the earlier version of
-this script lack the latter and are re-enriched. Use
-`python download.py --metadata-only --refresh-metadata` when you intentionally
-want to refresh counters that may have changed on AO3.
+Press Ctrl-C (or `kill` the process) to stop at the next safe point; the run
+prints a summary and exits. Run the same command again to resume.
 
-#### Numeric sorting and filtering
+## 3. Import into Calibre
 
-Kudos cannot be represented by an EPUB standard field, and putting `Kudos: 68`
-in Tags would sort it as text rather than as a number. Create Calibre custom
-columns and sync the enriched files instead:
+Drag the EPUBs from `downloaded/` into Calibre, or add them with
+`calibredb add`. The ten custom columns fill in on import, and each book also
+gets its AO3 work URL as an `ao3` identifier.
 
-```text
-python calibre_sync.py --library "/path/to/your/calibre/library" --create-columns
+Sort by **AO3 Kudos**, or search numerically: `#ao3_kudos:>1000`,
+`#words:<20000`, `#gfog:<8`. `#ao3_chapters:"~[?]"` finds works whose final
+chapter count is still unknown (`3/?`), which covers most works in progress; a
+work with a declared total, such as `3/10`, does not match. (A plain `"?"` matches
+every book.)
+
+**Calibre-Web** reads the same columns from Calibre's database. Restart it or
+rescan after importing, and check that its setting for ignored custom columns
+does not match `ao3_`.
+
+## What goes into each EPUB
+
+AO3's EPUB export does not include the work's statistics, so they are read from
+the work page and written into the file in three forms:
+
+- **Calibre column values** (`calibre:user_metadata`), which fill the custom
+  columns on import;
+- **portable `ao3:*` metadata** and an `ao3` identifier, which travel with the
+  file outside Calibre;
+- **a visible "AO3 statistics" block** in the description, shown in Calibre's
+  comments.
+
+| Column | From | Notes |
+| --- | --- | --- |
+| `#ao3_kudos`, `#ao3_hits`, `#ao3_bookmarks`, `#ao3_comments` | AO3 work page | AO3 omits a Kudos, Comments, or Bookmarks row when the count is zero, so a missing row is recorded as 0. |
+| `#ao3_words` | AO3 work page | AO3's own count. |
+| `#ao3_chapters` | AO3 work page | For example `12/12`, or `3/?` while in progress. |
+| `#ao3_status` | AO3 work page | The date AO3 shows as *Completed* or *Updated*. One-chapter works have none. |
+| `#ao3_category` | AO3 work page | For example `F/F` or `Gen, M/M`. |
+| `#words` | the EPUB | Every spine body, so it includes AO3's preface and notes. |
+| `#gfog` | the EPUB | Gunning Fog index, two decimals (`count-pages-compatible-pure-python-v1`). |
+
+Nothing is written for a value AO3 does not show, so a missing statistic never
+blanks a column.
+
+## Backfilling an existing Calibre library
+
+`backfill.py` fills the same columns for EPUBs already in a Calibre library. It
+is a one-time job. It never rewrites EPUBs, `metadata.opf` files, tags,
+identifiers, or other standard metadata. Every stage that talks to AO3 or
+changes the library needs an explicit `--approve-…` flag.
+
+Close Calibre and Calibre-Web first. The commands that change the library check
+this and refuse to run otherwise.
+
+**1. Scan the library** (read-only). This maps every EPUB to its AO3 work from
+the preface, and saves a report:
+
+```sh
+python3 backfill.py scan --library "/path/to/Calibre Library"
 ```
 
-The command creates and fills these columns:
+Local metrics are calculated for the first 25 works by default. Use
+`--metrics-limit N`, or `--metrics-all` for every EPUB, if you want more.
+`calculate-missing-metrics` later fills just the blanks, which is usually all
+that is needed.
 
-- `#ao3_kudos`
-- `#ao3_hits`
-- `#ao3_bookmarks`
-- `#ao3_comments`
-- `#ao3_words`
-- `#ao3_chapters`
-- `#ao3_status`
+**2. Create the columns**, after a verified backup of `metadata.db`:
 
-Use `--dry-run` first if you want to inspect the matches without changing the
-Calibre database:
-
-```text
-python calibre_sync.py --library "/path/to/your/calibre/library" --dry-run
+```sh
+python3 backfill.py backup --library "/path/to/Calibre Library"
+python3 backfill.py setup-columns --library "/path/to/Calibre Library" \
+  --backup "<path printed by backup>" --approve-columns
 ```
 
-Close Calibre and Calibre-Web before running the sync so neither application is
-writing `metadata.db` at the same time. Restart or rescan Calibre-Web after the
-sync. Its UI configuration can hide custom columns; make sure the regular
-expression for ignored columns does not match `ao3_` if you want to display
-them.
+**3. Check the login** with one round trip before starting a long fetch:
 
-In Calibre, sort the library by `AO3 Kudos` descending or search with a numeric
-query such as `#ao3_kudos:>100`. Calibre-Web reads the same custom columns from
-the Calibre database, so the values are available there as well.
-
-### Existing library backfill
-
-`ao3_backfill.py` handles an existing Calibre library without rewriting EPUBs,
-`metadata.opf` files, identifiers, or other standard metadata. Its scan report
-and append-only AO3 cache default to
-`~/.local/share/ao3-calibre-backfill`, outside this repository.
-
-Run the read-only scan first. It inventories every EPUB and mapping, and by
-default records local EPUB word counts and the documented pure-Python Gunning
-Fog compatibility metric for the first 25 non-ambiguous work IDs without
-rewriting EPUBs:
-
-```text
-python ao3_backfill.py scan --library "/path/to/your/calibre/library"
+```sh
+python3 backfill.py check-auth --approve-network
 ```
 
-Use `--metrics-limit 0` for an inventory-only scan, or pass a larger explicit
-limit when you are prepared for the additional sequential EPUB-read time. Use
-`--metrics-all` when local `#words`/`#gfog` values are required for every mapped
-EPUB before a bulk Calibre write; this can take substantially longer than the
-inventory scan.
+**4. Fetch AO3 statistics** into an append-only cache. At 10 seconds per work,
+about 15,000 works take roughly two days:
 
-For the safe default write policy, calculate only the missing local values
-instead of recomputing the entire library:
-
-```text
-python ao3_backfill.py calculate-missing-metrics \
-  --library "/path/to/your/calibre/library" \
-  --cache-dir "$HOME/.local/share/ao3-calibre-backfill"
+```sh
+nohup python3 backfill.py fetch --library "/path/to/Calibre Library" \
+  --use-env-credentials --approve-network \
+  --continue-after-review --keep-going --delay 10 --limit 15000 &
 ```
 
-This reads EPUBs and Calibre values but does not write Calibre. Existing local
-Words/Gfog values remain untouched.
+- Without `--continue-after-review` a batch is capped at 25 works, so you can
+  review a small run first. `--delay` defaults to 30 seconds, with a minimum of 5.
+- `--keep-going` makes the run unattended, with the same failure handling as
+  [downloads](#leaving-it-running). Without it, the first failure stops the run.
+- `--retry-failed-once` also re-requests works that came back incomplete or
+  unavailable, and retries an unrecognised page once.
+- `--refresh` re-fetches works that are already cached, and
+  `--include-ambiguous` includes EPUBs whose preface links more than one work.
+- Every result is written to disk as it arrives. To resume after a stop, run
+  the same command again.
 
-Before creating columns, close Calibre and Calibre-Web and make a verified
-backup. The setup command refuses to create a column with the wrong datatype:
+Check progress from another terminal at any time:
 
-```text
-python ao3_backfill.py backup --library "/path/to/your/calibre/library"
-python ao3_backfill.py setup-columns \
-  --library "/path/to/your/calibre/library" \
-  --backup "$HOME/.local/share/ao3-calibre-backfill/metadata.db.backup" \
-  --approve-columns
+```sh
+python3 backfill.py validate-cache
 ```
 
-Column creation changes `metadata.db`, so create another non-overwriting,
-provenance-checked backup after setup and use that newer backup for each later
-write batch. The freshness gate intentionally rejects a backup whose recorded
-source hash no longer matches the live database.
+**5. Write to Calibre.** Fill in any missing local metrics, take a backup
+immediately before writing, and write one book first. Each `backup` creates a
+new timestamped file and prints the exact `--backup "…"` to pass next; backups
+are never overwritten.
 
-```text
-python ao3_backfill.py backup \
-  --library "/path/to/your/calibre/library" \
-  --destination "$HOME/.local/share/ao3-calibre-backfill/metadata.db.post-category.backup"
+```sh
+python3 backfill.py calculate-missing-metrics --library "/path/to/Calibre Library"
+python3 backfill.py backup --library "/path/to/Calibre Library"
+python3 backfill.py write --library "/path/to/Calibre Library" \
+  --backup "<path printed by backup>" \
+  --write-local-metrics --approve-write --limit 1
 ```
 
-The backfill custom-column setup also creates and verifies `#ao3_category`
-(`AO3 Category`, text) through `calibredb` and read-only SQLite. It never
-changes standard Calibre tags.
+Check that book in Calibre. Then take a fresh backup, since any write
+invalidates the previous one, and write the rest:
 
-The fetch command requires an explicit approval flag, defaults to one
-sequential request every 30 seconds, and limits the first batch to 25 works.
-It checks the custom-column gate before making its first request. An AO3
-`Retry-After` response overrides the normal delay with the server-provided
-wait, and the cooldown is persisted in the cache context. Repeated rate
-limits, Cloudflare responses, authentication failures, or unexpected HTML stop
-the process without discarding earlier cache entries:
-
-```text
-python ao3_backfill.py fetch --library "/path/to/your/calibre/library" \
-  --approve-network --limit 25
-python ao3_backfill.py validate-cache
+```sh
+python3 backfill.py backup --library "/path/to/Calibre Library"
+python3 backfill.py write --library "/path/to/Calibre Library" \
+  --backup "<path printed by backup>" \
+  --write-local-metrics --approve-write --limit 20000
+python3 backfill.py verify-library --library "/path/to/Calibre Library"
 ```
 
-Review the exact first-25 refresh mappings without making requests, then take
-an external snapshot of the append-only cache before refresh mode:
+- The write uses Calibre's own API in a single `calibre-debug` process, one call
+  per column: about 110,000 values in seconds. Every value is then read back
+  through both `calibredb` and SQLite.
+- Only works that came back complete are written, and empty values are never
+  written.
+- `--write-local-metrics` fills `#words`/`#gfog` only where they are blank. Add
+  `--replace-local-metrics` to overwrite existing values. Add `--allow-partial`
+  if some works are not cached.
+- The write refuses to start unless the backup matches the current
+  `metadata.db` exactly. Calibre empties its trash once a day whenever a library
+  is opened, which counts as a change. If that happens between the backup and
+  the write, take a new backup.
+- Calibre refreshes each book's `metadata.opf` the next time it opens the
+  library, just as it does after any `calibredb` edit.
 
-```text
-python ao3_backfill.py snapshot-cache \
-  --cache-dir "$HOME/.local/share/ao3-calibre-backfill" \
-  --destination "$HOME/.local/share/ao3-calibre-backfill/ao3-cache.before-refresh.jsonl"
-python ao3_backfill.py preview-refresh \
-  --cache-dir "$HOME/.local/share/ao3-calibre-backfill" \
-  --limit 25
+**Optional: portable EPUB metadata.** `enrich-epubs` writes the `ao3:*` metadata
+into the library's EPUB files themselves, backing up each original first:
+
+```sh
+python3 backfill.py enrich-epubs --library "/path/to/Calibre Library" \
+  --backup "<path printed by backup>" \
+  --epub-backup-dir ~/.local/share/ao3-calibre-backfill/epub-originals \
+  --approve-epub-write --limit 1
 ```
 
-Run the long fetch in the foreground so request progress, retries, and stop
-conditions remain visible. `tee` keeps a copy of the same output in the
-external cache directory:
+Run `python3 backfill.py <command> --help` for every option.
+
+## Files outside the repository
+
+Logs, caches, and backups live in `~/.local/share/ao3-calibre-backfill/`, so
+nothing personal ends up in the repository:
+
+| Path | Contents |
+| --- | --- |
+| `logs/` | One timestamped log per run of either tool. |
+| `download-failures.jsonl` | Works that failed or are unavailable. Permanent entries (deleted, unrevealed) are skipped by later runs. |
+| `scan.json` | The backfill's map of library EPUBs to AO3 works. |
+| `ao3-cache.jsonl` | Fetched AO3 statistics. Append-only; the latest record per work wins. |
+| `ao3-cache.jsonl.failures.jsonl` | Works the backfill could not fetch. |
+| `ao3-cache.jsonl.fetch.lock` | Held by whichever AO3 run is active. |
+| `metadata.db.<timestamp>.backup` | Verified `metadata.db` backups, each with a checksum manifest. Never overwritten. |
+| `write-result-*.json` | Per-book results of each Calibre write. |
+
+## Project layout
 
 ```text
-set -o pipefail
-python /home/drifter/repos/ao3Archiver/ao3_backfill.py fetch \
-  --library "/home/drifter/Calibre Library" \
-  --cache-dir "$HOME/.local/share/ao3-calibre-backfill" \
-  --approve-network --use-env-credentials --retry-failed-once \
-  --continue-after-review --delay 30 --limit 14800 \
-  2>&1 | tee "$HOME/.local/share/ao3-calibre-backfill/fetch-full.log"
-fetch_status=${PIPESTATUS[0]}
-printf 'fetch exit status: %s\n' "$fetch_status"
+download.py                 entry point: download works
+backfill.py                 entry point: one-time library backfill
+ao3archiver/
+  ao3_client.py             everything that talks to AO3: login, request policy,
+                            page classification, EPUB downloads, run lock, work queue
+  download.py               the download workflow
+  backfill.py               the backfill workflow
+  calibre_library.py        columns, calibredb, backups, the bulk writer, verification
+  calibre_scripts/
+    bulk_write.py           runs under calibre-debug; kept apart from the package
+  metadata.py               AO3 page statistics and EPUB metadata
+  metrics.py                local Words and Gunning Fog
+  credentials.py            .env / environment / personal.ini
+  run_log.py                logging, progress and ETA, interrupts
+  common.py                 shared paths, base error, small helpers
+tests/                      one test module per package module, fakes in support.py
 ```
 
-Do not start a second fetch process while this one is running. The cache lock
-prevents concurrent cache access, but one foreground process is the intended
-operational model. Already cached work IDs are not requested again unless
-`--refresh` is explicitly supplied.
+## Development
 
-`--retry-failed-once` retries incomplete/unavailable cache records and an
-unexpected work-page response once. A second failure, repeated Cloudflare,
-repeated rate limiting, failed authentication, or malformed HTML stops the
-batch rather than continuing blindly. The cache is durable, so after reviewing
-the stop reason you can resume with the same command and the scheduler will
-honor the persisted request timestamp/cooldown.
-
-Add `--include-ambiguous` to both fetch commands only after reviewing the 11
-multi-work prefaces in the scan report.
-
-For an explicitly approved authenticated refresh, put `AO3_USERNAME` and
-`AO3_PASSWORD` in the ignored repository-local `.env` file or in the process
-environment, then opt in with `--use-env-credentials`. Process environment
-values take precedence. The backfill does not fall back to `personal.ini`:
-
-```text
-python ao3_backfill.py fetch --library "/path/to/your/calibre/library" \
-  --approve-network --use-env-credentials --refresh --limit 25
+```sh
+python3 -m pip install pytest
+python3 -m pytest
 ```
 
-Do not place the values in command history, logs, reports, cache records, or
-chat. A successful login is verified by an authenticated cookie or an
-unambiguous logged-in response. If a work request is redirected to login or
-returns HTTP 401/403, the backfill performs at most one reauthentication
-attempt for that work. Failed reauthentication stops the batch while
-preserving earlier cache records.
-
-After reviewing the cache, use the explicit write approval. The default write
-is one book so its values can be checked in Calibre before a larger batch:
-
-```text
-python ao3_backfill.py write --library "/path/to/your/calibre/library" \
-  --backup "$HOME/.local/share/ao3-calibre-backfill/metadata.db.post-category.backup" \
-  --approve-write --allow-partial --limit 1
-```
-
-Zero counters are stored as numeric zero; unavailable counters are skipped and
-existing custom-column values are preserved. EPUBs whose preface contains
-multiple work IDs are reported as ambiguous and skipped unless
-`--include-ambiguous` is supplied for both fetch and write review.
-
-To make the metadata portable inside existing EPUBs, use the separate explicit
-EPUB-enrichment stage. It writes only namespaced `ao3:*` metadata and creates a
-non-overwriting external backup for each original EPUB; it does not replace
-title, author, tags, identifiers, comments, series, covers, or formats:
-
-```text
-python ao3_backfill.py enrich-epubs \
-  --library "/path/to/your/calibre/library" \
-  --cache-dir "$HOME/.local/share/ao3-calibre-backfill" \
-  --backup "$HOME/.local/share/ao3-calibre-backfill/metadata.db.current.backup" \
-  --epub-backup-dir "$HOME/.local/share/ao3-calibre-backfill/epub-originals" \
-  --approve-epub-write --allow-partial --limit 1
-```
-
-Run the one-book enrichment first, inspect the EPUB and its portable metadata,
-then run the approved bulk enrichment before the Calibre custom-column write.
-
-Local `#words` and `#gfog` values are separate from AO3 `#ao3_words`. They are
-calculated from all EPUB spine body text, including AO3 prefaces, title pages,
-chapter headings, author notes, and end notes. The default local write mode
-fills only blank `#words`/`#gfog` cells and requires an explicit flag in
-addition to `--approve-write`:
-
-```text
-python ao3_backfill.py write --library "/path/to/your/calibre/library" \
-  --backup "$HOME/.local/share/ao3-calibre-backfill/metadata.db.post-category.backup" \
-  --approve-write --allow-partial --write-local-metrics --limit 1
-```
-
-The report identifies the local algorithm as
-`count-pages-compatible-pure-python-v1`. It follows the established Count
-Pages Gunning Fog formula and English syllable rules, with a deterministic
-punctuation sentence profile that guards common abbreviations and decimals. It
-does not claim bit-for-bit equivalence to Calibre's bundled sentence tokenizer
-or ICU word counting. Use
-`--replace-local-metrics` only after explicitly reviewing existing-value
-provenance.
+The suite runs offline against a fake AO3. Two integration tests also exercise
+the real `calibre-debug` and `calibredb`, and are skipped when Calibre is not
+installed.

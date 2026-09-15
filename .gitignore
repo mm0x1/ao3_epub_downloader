@@ -1,8 +1,19 @@
-downloaded/*
-links/*
-venv/
-__pycache__/
-*.log
-personal.ini
+# Credentials
 .env
-!placeholder.txt
+personal.ini
+
+# Your data: link lists and downloaded EPUBs
+links/
+downloaded/
+
+# Python
+__pycache__/
+.pytest_cache/
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Working notes
+.ai/

@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
 from html.parser import HTMLParser
+import json
 import os
 from pathlib import Path
-import json
 import re
 import stat
 import tempfile
-from typing import Iterator
-import zipfile
 import xml.etree.ElementTree as ET
-
+import zipfile
 
 DC_NS = "http://purl.org/dc/elements/1.1/"
 OPF_NS = "http://www.idpf.org/2007/opf"
@@ -159,6 +157,21 @@ def _parse_count(value: str | None) -> int | None:
     return int(digits) if digits else None
 
 
+# AO3 leaves the Comments, Kudos, and Bookmarks rows out of a work's stats block
+# when the count is zero. Across the 14,392 complete backfill records not one
+# of these counts was 0, and the 47 partial records lacked only comments or
+# bookmarks. Hits is always shown, so it marks a genuine stats block.
+OMITTED_WHEN_ZERO = frozenset({"comments", "kudos", "bookmarks"})
+
+
+def _count_or_omitted_zero(values: Mapping[str, str], field: str) -> int | None:
+    if field in values:
+        return _parse_count(values[field])
+    if field in OMITTED_WHEN_ZERO and "hits" in values:
+        return 0
+    return None
+
+
 def parse_ao3_metadata(html: str, work_url: str) -> AO3Metadata:
     """Parse AO3's work statistics from an HTML response."""
 
@@ -180,9 +193,9 @@ def parse_ao3_metadata(html: str, work_url: str) -> AO3Metadata:
         status=values.get("status"),
         words=_parse_count(values.get("words")),
         chapters=values.get("chapters"),
-        comments=_parse_count(values.get("comments")),
-        kudos=_parse_count(values.get("kudos")),
-        bookmarks=_parse_count(values.get("bookmarks")),
+        comments=_count_or_omitted_zero(values, "comments"),
+        kudos=_count_or_omitted_zero(values, "kudos"),
+        bookmarks=_count_or_omitted_zero(values, "bookmarks"),
         hits=_parse_count(values.get("hits")),
     )
 

@@ -1,14 +1,16 @@
+"""Tests for AO3 page parsing and EPUB metadata."""
+
 import json
+import os
+import stat
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
-import os
-import stat
 
-from ao3_metadata import (
-    AO3Metadata,
+from ao3archiver.metadata import (
     _calibre_user_metadata,
+    AO3Metadata,
     enrich_epub,
     enrich_epub_portable,
     has_ao3_metadata,
@@ -202,6 +204,31 @@ class AO3MetadataTest(unittest.TestCase):
             self.assertEqual(actual.kudos, 70)
             self.assertIsNone(actual.hits)
             self.assertEqual(stat.S_IMODE(os.stat(epub_path).st_mode), 0o644)
+
+
+class OmittedZeroCountsTest(unittest.TestCase):
+    def test_counts_missing_from_a_stats_block_with_hits_are_zero(self):
+        metadata = parse_ao3_metadata(
+            '<dl class="stats"><dd class="words">10</dd><dd class="hits">5</dd></dl>',
+            "https://archiveofourown.org/works/64805",
+        )
+
+        self.assertEqual((metadata.kudos, metadata.comments, metadata.bookmarks), (0, 0, 0))
+        self.assertEqual(metadata.hits, 5)
+
+    def test_present_counts_are_kept(self):
+        metadata = parse_ao3_metadata(AO3_PAGE, "https://archiveofourown.org/works/64805")
+
+        self.assertEqual((metadata.kudos, metadata.bookmarks), (68, 6))
+
+    def test_nothing_is_defaulted_when_hits_is_absent(self):
+        metadata = parse_ao3_metadata(
+            '<dl class="stats"><dd class="words">10</dd></dl>',
+            "https://archiveofourown.org/works/64805",
+        )
+
+        self.assertIsNone(metadata.kudos)
+        self.assertIsNone(metadata.comments)
 
 
 class CalibreUserMetadataTest(unittest.TestCase):

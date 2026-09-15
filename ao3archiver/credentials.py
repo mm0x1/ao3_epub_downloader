@@ -7,19 +7,22 @@ callers only ever learn which source supplied the pair.
 
 from __future__ import annotations
 
-import configparser
 from collections.abc import Mapping
+import configparser
 from dataclasses import dataclass
 import os
 from pathlib import Path
 
-DEFAULT_DOTENV_PATH = Path(__file__).with_name(".env")
-DEFAULT_INI_PATH = Path(__file__).with_name("personal.ini")
+from ao3archiver.common import ArchiverError, REPO_ROOT
+from ao3archiver.run_log import register_secret
+
+DEFAULT_DOTENV_PATH = REPO_ROOT / ".env"
+DEFAULT_INI_PATH = REPO_ROOT / "personal.ini"
 INI_SECTION = "archiveofourown.org"
 CREDENTIAL_KEYS = ("AO3_USERNAME", "AO3_PASSWORD")
 
 
-class CredentialError(RuntimeError):
+class CredentialError(ArchiverError):
     """Credentials are missing or the credential file is unreadable."""
 
 
@@ -130,3 +133,25 @@ def resolve_credentials(
                 f"environment or {dotenv_path}, or fill in {ini_path}."
             ) from error
         return fallback
+
+
+def load_run_credentials(
+    *,
+    allow_ini_fallback: bool = False,
+    environ: Mapping[str, str] | None = None,
+    dotenv_path: Path | None = DEFAULT_DOTENV_PATH,
+    ini_path: Path | None = DEFAULT_INI_PATH,
+) -> AO3Credentials:
+    """Load the pair a run will sign in with and redact it from every later log line.
+
+    The backfill uses only the environment and ``.env``; downloads may also fall
+    back to the legacy ``personal.ini``.
+    """
+
+    if allow_ini_fallback:
+        credentials = resolve_credentials(dotenv_path=dotenv_path, ini_path=ini_path, environ=environ)
+    else:
+        credentials = load_ao3_credentials(environ, dotenv_path=dotenv_path)
+    register_secret(credentials.username)
+    register_secret(credentials.password)
+    return credentials

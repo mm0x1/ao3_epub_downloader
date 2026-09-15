@@ -1,10 +1,12 @@
+"""Tests for logging, progress, and interrupt handling."""
+
 import io
 import logging
 from pathlib import Path
 import tempfile
 import unittest
 
-import run_log
+from ao3archiver import run_log
 
 
 def make_logger(name: str) -> tuple[logging.Logger, io.StringIO]:

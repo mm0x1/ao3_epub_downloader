@@ -1,19 +1,21 @@
-"""Safely backfill AO3 engagement metadata into an existing Calibre library.
+"""One-time backfill of AO3 statistics into an existing Calibre library.
 
-The scanner only reads EPUBs. The network stage only writes a JSONL cache, and
-the Calibre stage only uses ``calibredb set_custom`` for the AO3 columns.
+Stages, each behind its own explicit gate: scan the library's EPUBs and map
+them to AO3 works (read-only); fetch current AO3 statistics into an
+append-only JSONL cache; optionally calculate missing local metrics; then
+write the cached values into Calibre custom columns through Calibre's API,
+with a verified metadata.db backup and read-back verification.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-import hashlib
+import fcntl
 import json
 import logging
 import math
@@ -21,140 +23,106 @@ import os
 from pathlib import Path
 import posixpath
 import re
-import shlex
 import shutil
 import sqlite3
-import subprocess
 import time
-from email.utils import parsedate_to_datetime
-from html.parser import HTMLParser
 from typing import cast
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 
-import fcntl
 import requests
 
-from credentials import (
-    DEFAULT_DOTENV_PATH,
-    AO3Credentials,
-    CredentialError,
-    load_ao3_credentials,
+from ao3archiver.ao3_client import (
+    _WorkLinkParser,
+    account_lock,
+    AO3Fetcher,
+    AO3FetchRecord,
+    Cooldown,
+    CredentialsRejected,
+    DEFAULT_DELAY_SECONDS,
+    FAILURE_STREAK_COOLDOWN_THRESHOLD,
+    login_authenticated_session,
+    MINIMUM_DELAY_SECONDS,
+    NetworkStopError,
+    sign_in_patiently,
+    SYSTEMIC_FETCH_ERRORS,
 )
-from run_log import (
-    DEFAULT_LOG_DIR,
-    ProgressTracker,
-    RunInterrupted,
+from ao3archiver.calibre_library import (
+    AO3_COLUMNS,
+    BulkWriteError,
+    create_backup,
+    load_calibre_books,
+    load_local_metric_values,
+    LOCAL_METRIC_COLUMNS,
+    read_library_uuid,
+    require_calibre_closed,
+    run_calibre_bulk_write,
+    running_calibre_processes,
+    setup_custom_columns,
+    verify_backup,
+    verify_custom_columns,
+    verify_library_values,
+    verify_local_metric_columns,
+    verify_written_values,
+)
+from ao3archiver.common import (
+    ArchiverError,
+    REPO_ROOT,
+    sha256_file,
+    STATE_DIR,
+    utc_now,
+    write_json_atomically,
+)
+from ao3archiver.credentials import load_run_credentials
+from ao3archiver.metadata import (
+    AO3Metadata,
+    canonical_work_url,
+    enrich_epub_portable,
+    read_ao3_metadata,
+    validate_epub_file,
+)
+from ao3archiver.metrics import calculate_epub_metrics, LOCAL_METRICS_ALGORITHM
+from ao3archiver.run_log import (
     configure_logging,
+    DEFAULT_LOG_DIR,
     format_clock,
     format_duration,
     interrupt_guard,
     log_banner,
+    ProgressTracker,
     redact_secrets,
-    register_secret,
+    RunInterrupted,
 )
 
-from ao3_metadata import (
-    AO3Metadata,
-    canonical_work_url,
-    enrich_epub_portable,
-    parse_ao3_metadata,
-    read_ao3_metadata,
-    validate_epub_file,
-)
-from calibre_sync import BACKFILL_CUSTOM_COLUMNS, run_calibredb, sanitized_child_environment
-from local_metrics import LOCAL_METRICS_ALGORITHM, calculate_epub_metrics
-
-
-DEFAULT_DELAY_SECONDS = 30.0
-# The default is deliberately cautious, but it is not an AO3-published limit.
-# ao3downloadernew reserves its 30s for listing/search pages and uses no delay
-# at all between individual work pages, which is what this tool fetches. The
-# floor exists to stop a typo turning into a flood, not to enforce 30s.
-MINIMUM_DELAY_SECONDS = 5.0
-DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_BATCH_SIZE = 25
-DEFAULT_CACHE_DIR = Path.home() / ".local" / "share" / "ao3-calibre-backfill"
-SCAN_REPORT_NAME = "scan.json"
-CACHE_NAME = "ao3-cache.jsonl"
-BACKUP_NAME = "metadata.db.backup"
-COUNTER_ATTRIBUTES = ("kudos", "hits", "bookmarks", "comments", "words")
-# Cloudflare's 5xx range means Cloudflare could not reach or talk to AO3's
-# origin. That is an AO3-side outage, not a bot challenge, and it is transient.
-CLOUDFLARE_ORIGIN_STATUS_CODES = frozenset({520, 521, 522, 523, 524, 525, 526, 527, 530})
-TRANSIENT_STATUS_CODES = frozenset({500, 502, 503, 504}) | CLOUDFLARE_ORIGIN_STATUS_CODES
-# AO3 emits transient 5xx and Cloudflare origin errors routinely. These get
-# their own retry budget so that --retry-failed-once, which is about unexpected
-# HTML, does not also shrink tolerance for a passing AO3 blip to one attempt.
-MAX_TRANSIENT_ATTEMPTS = 8
-TRANSIENT_MAX_BACKOFF_SECONDS = 300.0
-# AO3 answers a rate limit with an exact Retry-After, typically a five-minute
-# pause. Waiting it out is the correct response, so this budget is generous and
-# separate from max_attempts; a run should not die because AO3 asked it to slow
-# down twice in 40 hours.
-MAX_RATE_LIMIT_ATTEMPTS = 10
-RETRY_AFTER_DATE_SKEW_SECONDS = 0.0
-REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
-MAX_AO3_REDIRECTS = 5
-LOCAL_METRIC_COLUMNS = (
-    ("words", "Words", "int", "local_words"),
-    ("gfog", "Gfog", "float", "local_gfog"),
-)
 
-# Keep the old public name available to existing callers/tests while the
-# backfill explicitly uses the extended contract.
-CUSTOM_COLUMNS = BACKFILL_CUSTOM_COLUMNS
+
+DEFAULT_CACHE_DIR = STATE_DIR
+
+
+SCAN_REPORT_NAME = "scan.json"
+
+
+CACHE_NAME = "ao3-cache.jsonl"
+
+
+
 
 LOGGER = logging.getLogger("ao3.backfill")
+
+
 PROGRESS_SUMMARY_EVERY = 25
+
+
 REVALIDATION_PROGRESS_EVERY = 2000
-# --keep-going: this many consecutive per-work failures points at AO3 or the
-# session rather than the works, so the run pauses instead of burning through
-# the queue while something global is wrong.
-FAILURE_STREAK_COOLDOWN_THRESHOLD = 5
-COOLDOWN_SCHEDULE_SECONDS = (300.0, 900.0, 1800.0, 3600.0)
+
+
 LONG_WAIT_ANNOUNCE_SECONDS = 60.0
 
 
-class BackfillError(RuntimeError):
+class BackfillError(ArchiverError):
     """Base error for a safety-gated backfill operation."""
-
-
-class ColumnConfigurationError(BackfillError):
-    """The Calibre custom columns do not match the required schema."""
-
-
-class CalibreInUseError(BackfillError):
-    """A Calibre process is using the library during a write operation."""
-
-
-class NetworkStopError(BackfillError):
-    """AO3 returned a response for which the policy requires stopping."""
-
-
-class UnexpectedHTML(NetworkStopError):
-    """The response was not a recognizable AO3 work page."""
-
-
-class RepeatedCloudflare(NetworkStopError):
-    """Cloudflare responses repeated during a single fetch."""
-
-
-class RepeatedRateLimit(NetworkStopError):
-    """AO3 rate-limited repeated requests."""
-
-
-class AuthenticationFailure(NetworkStopError):
-    """AO3 indicated that authentication is required or failed."""
-
-
-class CredentialsRejected(AuthenticationFailure):
-    """AO3 refused the username/password itself; retrying cannot help.
-
-    Kept distinct so an unattended run stops instead of repeatedly submitting
-    credentials that are known to be wrong.
-    """
 
 
 @dataclass(frozen=True)
@@ -366,106 +334,6 @@ class ScanReport:
 
 
 @dataclass(frozen=True)
-class AO3FetchRecord:
-    """A durable, sanitized result for one AO3 work-page request."""
-
-    work_id: str
-    work_url: str
-    fetched_at: str
-    availability: str
-    title: str | None = None
-    authors: tuple[str, ...] = ()
-    category: str | None = None
-    status: str | None = None
-    chapters: str | None = None
-    words: int | None = None
-    comments: int | None = None
-    kudos: int | None = None
-    bookmarks: int | None = None
-    hits: int | None = None
-    http_status: int | None = None
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, object]:
-        result = asdict(self)
-        result["authors"] = list(self.authors)
-        return {"schema_version": 1, **result}
-
-    @classmethod
-    def from_dict(cls, value: dict[str, object]) -> "AO3FetchRecord":
-        work_id = str(value.get("work_id", ""))
-        if not re.fullmatch(r"[0-9]+", work_id):
-            raise ValueError("cache field work_id must be numeric")
-        work_url = str(value.get("work_url", ""))
-        if work_url != canonical_work_url(work_id):
-            raise ValueError("cache field work_url does not match work_id")
-        availability = str(value.get("availability", ""))
-        if availability not in {"ok", "incomplete", "unavailable"}:
-            raise ValueError("cache field availability is invalid")
-        fetched_at = str(value.get("fetched_at", ""))
-        if not fetched_at:
-            raise ValueError("cache field fetched_at is empty")
-        authors = value.get("authors", [])
-        if isinstance(authors, str):
-            author_values = (authors,)
-        elif isinstance(authors, list):
-            author_values = tuple(str(author) for author in authors)
-        else:
-            author_values = ()
-
-        def optional_int(name: str) -> int | None:
-            raw = value.get(name)
-            if raw is None or raw == "":
-                return None
-            if isinstance(raw, bool):
-                raise ValueError(f"cache field {name} must not be boolean")
-            if isinstance(raw, int):
-                if raw < 0:
-                    raise ValueError(f"cache field {name} must not be negative")
-                return raw
-            if isinstance(raw, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)", raw):
-                return int(raw)
-            raise ValueError(f"cache field {name} is not a non-negative integer")
-
-        raw_http_status = value.get("http_status")
-        http_status: int | None = None
-        if raw_http_status is not None:
-            if isinstance(raw_http_status, bool):
-                raise ValueError("cache field http_status must not be boolean")
-            if isinstance(raw_http_status, int):
-                http_status = raw_http_status
-            elif isinstance(raw_http_status, str) and re.fullmatch(r"[0-9]+", raw_http_status):
-                http_status = int(raw_http_status)
-            else:
-                raise ValueError("cache field http_status is invalid")
-            if not 100 <= http_status <= 599:
-                raise ValueError("cache field http_status is outside the HTTP range")
-
-        return cls(
-            work_id=work_id,
-            work_url=work_url,
-            fetched_at=fetched_at,
-            availability=availability,
-            title=str(value["title"]) if value.get("title") is not None else None,
-            authors=author_values,
-            category=str(value["category"]) if value.get("category") is not None else None,
-            status=str(value["status"]) if value.get("status") is not None else None,
-            chapters=str(value["chapters"]) if value.get("chapters") is not None else None,
-            words=optional_int("words"),
-            comments=optional_int("comments"),
-            kudos=optional_int("kudos"),
-            bookmarks=optional_int("bookmarks"),
-            hits=optional_int("hits"),
-            http_status=http_status,
-            error=str(value["error"]) if value.get("error") is not None else None,
-        )
-
-    def value_for(self, attribute: str) -> str:
-        value = getattr(self, attribute)
-        return "" if value is None else str(value)
-
-
-@dataclass(frozen=True)
 class CacheValidation:
     records: dict[str, AO3FetchRecord]
     work_ids: tuple[str, ...]
@@ -474,82 +342,6 @@ class CacheValidation:
     incomplete: tuple[str, ...]
     complete: tuple[str, ...]
     mappings: dict[str, EpubMapping]
-
-
-class _WorkLinkParser(HTMLParser):
-    """Find work links in document order without requiring valid XHTML."""
-
-    pattern = re.compile(
-        r"(?:https?://)?(?:www\.)?archiveofourown\.org/works/(\d+)(?:[/?#]|$)"
-        r"|/works/(\d+)(?:[/?#]|$)",
-        re.IGNORECASE,
-    )
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.work_ids: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._handle_anchor(tag, attrs)
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._handle_anchor(tag, attrs)
-
-    def _handle_anchor(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "a":
-            return
-        href = dict(attrs).get("href") or ""
-        match = self.pattern.search(href)
-        if match:
-            work_id = match.group(1) or match.group(2)
-            if work_id not in self.work_ids:
-                self.work_ids.append(work_id)
-
-
-class _WorkPageTextParser(HTMLParser):
-    """Extract title and author text from an AO3 work page."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self._depth = 0
-        self._title_depth: int | None = None
-        self._title_parts: list[str] = []
-        self._author_depth: int | None = None
-        self._author_parts: list[str] = []
-        self.authors: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._depth += 1
-        attributes = dict(attrs)
-        classes = set((attributes.get("class") or "").split())
-        if tag.casefold() == "h2" and "title" in classes and self._title_depth is None:
-            self._title_depth = self._depth
-            self._title_parts = []
-        if tag.casefold() == "a" and "author" in (attributes.get("rel") or "").split():
-            self._author_depth = self._depth
-            self._author_parts = []
-
-    def handle_data(self, data: str) -> None:
-        if self._title_depth is not None and self._depth >= self._title_depth:
-            self._title_parts.append(data)
-        if self._author_depth is not None and self._depth >= self._author_depth:
-            self._author_parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._author_depth == self._depth:
-            author = " ".join("".join(self._author_parts).split())
-            if author and author not in self.authors:
-                self.authors.append(author)
-            self._author_depth = None
-            self._author_parts = []
-        if self._title_depth == self._depth:
-            self._title_depth = None
-        self._depth = max(0, self._depth - 1)
-
-    @property
-    def title(self) -> str | None:
-        value = " ".join("".join(self._title_parts).split())
-        return value or None
 
 
 def _local_name(tag: str) -> str:
@@ -687,21 +479,6 @@ def _identifier_has_ao3_work(value: object) -> bool:
     return False
 
 
-def load_calibre_books(calibredb: str, library: Path) -> list[dict[str, object]]:
-    output = run_calibredb(
-        calibredb,
-        library,
-        "list",
-        "--for-machine",
-        "--fields",
-        "id,title,authors,formats,identifiers",
-    )
-    raw_books = json.loads(output)
-    if not isinstance(raw_books, list):
-        raise BackfillError("calibredb returned an unexpected book list")
-    return [book for book in raw_books if isinstance(book, dict)]
-
-
 def scan_library(
     library: Path,
     calibredb: str = "calibredb",
@@ -819,19 +596,8 @@ def scan_library(
     )
 
 
-def _write_json_atomically(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f"{path.suffix}.tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-
-
 def write_scan_report(report: ScanReport, report_path: Path) -> None:
-    _write_json_atomically(report_path, report.to_dict())
+    write_json_atomically(report_path, report.to_dict())
 
 
 def load_scan_report(report_path: Path) -> ScanReport:
@@ -882,7 +648,7 @@ class CacheStore:
         entry = {
             "work_id": work_id,
             "work_url": canonical_work_url(work_id),
-            "failed_at": _utc_now(),
+            "failed_at": utc_now(),
             "error_type": error_type,
             "error": redact_secrets(message),
         }
@@ -932,37 +698,15 @@ class CacheStore:
                 self._lock_depth = 0
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    @contextmanager
-    def fetch_lock(self):
-        """Hold a run-scoped lock so only one fetch process can ever be live.
+    def fetch_lock(self) -> AbstractContextManager[None]:
+        """Hold the account-wide run lock beside this cache; see ``account_lock``.
 
         This is separate from ``operation_lock`` on purpose: a fetch runs for
         days, and read-only commands must still be able to inspect the cache
         while it runs.
         """
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.fetch_lock_path.open("a+", encoding="utf-8") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
-                lock.seek(0)
-                holder = lock.read().strip() or "an unknown process"
-                raise BackfillError(
-                    f"Another fetch already holds {self.fetch_lock_path} ({holder}). "
-                    "Never run two fetch processes against one cache."
-                ) from error
-            lock.seek(0)
-            lock.truncate()
-            lock.write(f"pid {os.getpid()}\n")
-            lock.flush()
-            try:
-                yield
-            finally:
-                lock.seek(0)
-                lock.truncate()
-                lock.flush()
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return account_lock(self.fetch_lock_path)
 
     def records(self) -> dict[str, AO3FetchRecord]:
         with self.operation_lock():
@@ -1039,13 +783,13 @@ class CacheStore:
             if "next_request_at" not in actual:
                 actual["next_request_at"] = None
             if needs_context_update:
-                _write_json_atomically(self.context_path, actual)
+                write_json_atomically(self.context_path, actual)
             return
         if self.path.exists() and self.path.stat().st_size > 0:
             raise BackfillError(
                 f"Non-empty cache has no provenance context; refusing to adopt it: {self.path}"
             )
-        _write_json_atomically(
+        write_json_atomically(
             self.context_path,
             {**expected, "last_request_at": None, "next_request_at": None},
         )
@@ -1073,7 +817,7 @@ class CacheStore:
     def set_last_request_at_unlocked(self, timestamp: float) -> None:
         context = self._context_unlocked()
         context["last_request_at"] = timestamp
-        _write_json_atomically(self.context_path, context)
+        write_json_atomically(self.context_path, context)
 
     def next_request_at_unlocked(self) -> float | None:
         value = self._context_unlocked().get("next_request_at")
@@ -1092,7 +836,7 @@ class CacheStore:
         context = self._context_unlocked()
         context["last_request_at"] = timestamp
         context["next_request_at"] = timestamp + delay_seconds
-        _write_json_atomically(self.context_path, context)
+        write_json_atomically(self.context_path, context)
 
     def defer_requests_unlocked(
         self,
@@ -1108,7 +852,7 @@ class CacheStore:
         current_timestamp = float(current) if isinstance(current, (int, float)) else None
         requested = wall_time_fn() + seconds
         context["next_request_at"] = requested if exact else max(current_timestamp or requested, requested)
-        _write_json_atomically(self.context_path, context)
+        write_json_atomically(self.context_path, context)
 
     def request_schedule(self) -> tuple[float | None, float | None]:
         """Read the persisted (last, next) request timestamps under the lock."""
@@ -1149,7 +893,7 @@ class CacheStore:
                 raise BackfillError(f"Cache snapshot destination already exists: {destination}") from error
             if destination.stat().st_size != self.path.stat().st_size:
                 raise BackfillError(f"Cache snapshot size differs from source: {destination}")
-            if _sha256_file(destination) != _sha256_file(self.path):
+            if sha256_file(destination) != sha256_file(self.path):
                 raise BackfillError(f"Cache snapshot checksum differs from source: {destination}")
             return destination
 
@@ -1208,876 +952,6 @@ class CacheRequestScheduler:
         self.cache.defer_requests(seconds, self.wall_time_fn, exact=exact)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_page_title_and_authors(html: str) -> tuple[str | None, tuple[str, ...]]:
-    parser = _WorkPageTextParser()
-    parser.feed(html)
-    parser.close()
-    return parser.title, tuple(parser.authors)
-
-
-def _html_contains_work_id(html: str, work_id: str) -> bool:
-    return bool(
-        re.search(
-            rf"(?:https?://)?(?:www\.)?archiveofourown\.org/works/{re.escape(work_id)}(?:[/?#\"'<\s]|$)",
-            html,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _work_id_from_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    match = _WorkLinkParser.pattern.search(value)
-    if match is None:
-        return None
-    return match.group(1) or match.group(2)
-
-
-def _is_work_response_url(value: str, work_id: str) -> bool:
-    if not _is_ao3_url(value):
-        return False
-    path = urllib.parse.urlparse(value).path.rstrip("/")
-    return bool(re.fullmatch(rf"/works/{re.escape(work_id)}(?:/.*)?", path))
-
-
-def _looks_like_ao3_work_page(
-    html: str,
-    work_id: str,
-    response_url: str | None = None,
-) -> bool:
-    lowered = html.casefold()
-    response_work_id = _work_id_from_url(response_url)
-    requested_link = _html_contains_work_id(html, work_id)
-    requested_response = response_work_id == work_id
-    has_preface = 'id="preface"' in lowered or "id='preface'" in lowered
-    has_stats = "<dl class=\"stats" in lowered or "<dl class='stats" in lowered
-    has_title = "class=\"title heading" in lowered or "class='title heading" in lowered
-    has_chapter_id = bool(re.search(r"id=['\"][^'\"]*chapter[-_]", lowered))
-    has_chapter_page = (
-        "chapters-show" in lowered
-        and "works-show" in lowered
-        and "userstuff" in lowered
-    )
-    structure = (
-        has_preface
-        or has_stats
-        or ("archive of our own" in lowered and has_title)
-        or (requested_response and (has_chapter_id or has_chapter_page))
-    )
-    return (requested_link or requested_response) and structure
-
-
-UNREVEALED_WORK_NOTICE_PATTERN = re.compile(
-    r"this\s+work\s+is\s+part\s+of\s+an\s+ongoing\s+challenge\s+and\s+will\s+be\s+revealed\s+soon",
-    re.IGNORECASE,
-)
-UNREVEALED_COLLECTION_PATTERN = re.compile(r'href=["\'](/collections/[^"\'?#]+)', re.IGNORECASE)
-PAGE_TITLE_PATTERN = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-
-
-def _unrevealed_work_collection(html: str, work_id: str, response_url: str | None) -> str | None:
-    """Return the collection path if this is an AO3 "Mystery Work" page, else None.
-
-    A work in an unrevealed challenge collection is served at its own URL with
-    HTTP 200, but AO3 withholds the preface, statistics, and chapters and shows
-    only a notice. That is a legitimate state of the work, not unexpected HTML.
-    Only called after the normal structure check fails, so a real work page can
-    never be classified this way.
-    """
-
-    if _work_id_from_url(response_url) != work_id:
-        return None
-    if "works-show" not in html.casefold():
-        return None
-    notice = UNREVEALED_WORK_NOTICE_PATTERN.search(html)
-    if notice is None:
-        return None
-    # Search the original text so the collection slug keeps its case.
-    match = UNREVEALED_COLLECTION_PATTERN.search(html, notice.end())
-    return match.group(1) if match else "<unknown collection>"
-
-
-def _page_title(html: str) -> str | None:
-    match = PAGE_TITLE_PATTERN.search(html)
-    return " ".join(match.group(1).split()) if match else None
-
-
-def _metadata_from_page(
-    html: str,
-    work_url: str,
-    http_status: int,
-    response_url: str | None = None,
-) -> AO3FetchRecord:
-    work_id = work_url.rsplit("/", 1)[-1]
-    response_work_id = _work_id_from_url(response_url)
-    if response_url is not None and not _is_work_response_url(response_url, work_id):
-        raise UnexpectedHTML("AO3 response URL was not the requested work route")
-    if response_work_id is not None and response_work_id != work_id:
-        raise UnexpectedHTML("AO3 response URL did not match the requested work")
-    if not _looks_like_ao3_work_page(html, work_id, response_url):
-        collection = _unrevealed_work_collection(html, work_id, response_url)
-        if collection is not None:
-            # Cached as unavailable so writes skip it, and so a later run with
-            # --retry-failed-once picks it up again once the collection reveals.
-            return AO3FetchRecord(
-                work_id=work_id,
-                work_url=work_url,
-                fetched_at=_utc_now(),
-                availability="unavailable",
-                http_status=http_status,
-                error=f"AO3 work is unrevealed (Mystery Work in {collection}); statistics are hidden",
-            )
-        raise UnexpectedHTML(
-            f"AO3 response did not contain the requested work page "
-            f"(page title: {_page_title(html) or '<none>'!r})"
-        )
-    title, authors = _parse_page_title_and_authors(html)
-    try:
-        metadata = parse_ao3_metadata(html, work_url)
-    except ValueError as error:
-        return AO3FetchRecord(
-            work_id=work_id,
-            work_url=work_url,
-            fetched_at=_utc_now(),
-            availability="incomplete",
-            title=title,
-            authors=authors,
-            http_status=http_status,
-            error="AO3 page did not expose a statistics block",
-        )
-
-    if metadata.work_id != work_id:
-        raise UnexpectedHTML("AO3 response work ID did not match the requested work")
-    availability = "ok"
-    if any(getattr(metadata, field) is None for field in COUNTER_ATTRIBUTES):
-        availability = "incomplete"
-    return AO3FetchRecord(
-        work_id=metadata.work_id,
-        work_url=metadata.work_url,
-        fetched_at=_utc_now(),
-        availability=availability,
-        title=title or metadata.title,
-        authors=authors or metadata.authors,
-        category=metadata.category,
-        status=metadata.status,
-        chapters=metadata.chapters,
-        words=metadata.words,
-        comments=metadata.comments,
-        kudos=metadata.kudos,
-        bookmarks=metadata.bookmarks,
-        hits=metadata.hits,
-        http_status=http_status,
-        error=None if availability == "ok" else "one or more counters were unavailable",
-    )
-
-
-def _is_cloudflare_challenge(response: requests.Response) -> bool:
-    """Detect a Cloudflare bot challenge or block, which must stop the run.
-
-    ``id="cf-wrapper"`` is deliberately not a marker: it wraps every Cloudflare
-    error page, including the 5xx origin errors that mean AO3 itself is down.
-    Treating those as a challenge reports an AO3 outage as a bot block and
-    turns a transient failure into a fatal one.
-    """
-
-    content_type = response.headers.get("Content-Type", "").casefold()
-    if not content_type.startswith("text/html"):
-        return False
-    if response.status_code in CLOUDFLARE_ORIGIN_STATUS_CODES:
-        return False
-    lowered = response.text.casefold()
-    markers = (
-        "<title>just a moment...</title>",
-        "<title>attention required!</title>",
-        "<title>access denied</title>",
-        "cf-browser-verification",
-        'id="challenge-error-text"',
-        "_cf_chl_opt",
-    )
-    return any(marker in lowered for marker in markers)
-
-
-def _cloudflare_origin_error(response: requests.Response, step: str) -> str | None:
-    """Describe a Cloudflare-to-origin failure, or None if this is not one."""
-
-    if response.status_code not in CLOUDFLARE_ORIGIN_STATUS_CODES:
-        return None
-    reasons = {
-        520: "the origin returned an unknown error",
-        521: "the origin refused the connection",
-        522: "the connection to the origin timed out",
-        523: "the origin is unreachable",
-        524: "the origin took too long to respond",
-        525: "the TLS handshake with the origin failed",
-        526: "the origin's certificate is invalid",
-        527: "the connection to the origin was interrupted",
-        530: "the origin returned an error",
-    }
-    reason = reasons.get(response.status_code, "the origin could not be reached")
-    return (
-        f"Cloudflare could not reach AO3 at {step}: HTTP "
-        f"{response.status_code} because {reason}. This is a server-side failure "
-        "between Cloudflare and AO3, not a credential or rate-limit problem, "
-        "and it is usually transient"
-    )
-
-
-def _is_authentication_response(response: requests.Response) -> bool:
-    if response.status_code in (401, 403):
-        return True
-    lowered = response.text.casefold()
-    return any(
-        marker in lowered
-        for marker in (
-            "please log in",
-            "invalid username or password",
-            "must be logged in",
-            "you must log in",
-            "log in to continue",
-            "please sign in",
-            "authentication required",
-        )
-    )
-
-
-AO3_HOSTS = frozenset({"archiveofourown.org", "www.archiveofourown.org"})
-
-
-def _is_ao3_url(value: object, hosts: frozenset[str] = AO3_HOSTS) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = urllib.parse.urlparse(value)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and port in {None, 443}
-        and not parsed.username
-        and not parsed.password
-        and hostname in hosts
-    )
-
-
-def _is_login_url(value: object) -> bool:
-    if not _is_ao3_url(value):
-        return False
-    parsed = urllib.parse.urlparse(cast(str, value))
-    return parsed.path.rstrip("/").casefold() == "/users/login"
-
-
-def _is_login_redirect(response: requests.Response) -> bool:
-    if _is_login_url(getattr(response, "url", None)):
-        return True
-    history = getattr(response, "history", ())
-    return any(_is_login_url(getattr(item, "url", None)) for item in history)
-
-
-def _is_final_login_response(response: requests.Response) -> bool:
-    return _is_login_url(getattr(response, "url", None))
-
-
-def _auth_cookie_fingerprints(session: requests.Session) -> frozenset[str]:
-    fingerprints: set[str] = set()
-    for cookie in session.cookies:
-        if cookie.name not in {"user_session", "user_session_secure"}:
-            continue
-        value = "\x00".join(
-            str(getattr(cookie, field, ""))
-            for field in ("domain", "path", "name", "value")
-        )
-        fingerprints.add(hashlib.sha256(value.encode("utf-8")).hexdigest())
-    return frozenset(fingerprints)
-
-
-def _redirect_target(
-    response: requests.Response,
-    current_url: str,
-    hosts: frozenset[str] = AO3_HOSTS,
-) -> str | None:
-    if response.status_code not in REDIRECT_STATUS_CODES:
-        return None
-    location = response.headers.get("Location")
-    if not location:
-        raise NetworkStopError("AO3 response contained a redirect without a destination")
-    target = urllib.parse.urljoin(current_url, location)
-    if not _is_ao3_url(target, hosts):
-        raise NetworkStopError("AO3 response redirected away from archiveofourown.org")
-    return target
-
-
-WORK_ROUTE_PATTERN = re.compile(r"/works/(\d+)/?")
-FIRST_CHAPTER_ROUTE_PATTERN = re.compile(r"/works/(\d+)/chapters/\d+/?")
-
-
-def _is_same_work_chapter_redirect(current_url: str, target: str) -> bool:
-    """True for AO3's canonical ``/works/<id>`` -> ``/works/<id>/chapters/<n>`` hop.
-
-    AO3 redirects almost every work to its first chapter. The redirect response
-    costs the server a fraction of a second and a browser follows it at once,
-    so pacing it as a separate request only doubled the run time.
-    """
-
-    if not _is_ao3_url(target):
-        return False
-    source = WORK_ROUTE_PATTERN.fullmatch(urllib.parse.urlparse(current_url).path)
-    destination = FIRST_CHAPTER_ROUTE_PATTERN.fullmatch(urllib.parse.urlparse(target).path)
-    return bool(source and destination and source.group(1) == destination.group(1))
-
-
-def _get_with_ao3_redirects(
-    session: requests.Session,
-    url: str,
-    *,
-    timeout_seconds: float,
-    before_request: Callable[[], None],
-    request_started_callback: Callable[[float], None] | None,
-    request_deferred_callback: Callable[[float, bool], None] | None = None,
-    sleep_fn: Callable[[float], None] = time.sleep,
-    wall_time_fn: Callable[[], float] = time.time,
-    allowed_hosts: frozenset[str] = AO3_HOSTS,
-) -> requests.Response:
-    current_url = url
-    paced = True
-    for redirect_count in range(MAX_AO3_REDIRECTS + 1):
-        if paced:
-            before_request()
-        if request_started_callback is not None:
-            request_started_callback(wall_time_fn())
-        response = session.get(
-            current_url,
-            timeout=timeout_seconds,
-            allow_redirects=False,
-        )
-        target = _redirect_target(response, current_url, allowed_hosts)
-        if target is None:
-            return response
-        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-        if retry_after is not None:
-            if request_deferred_callback is not None:
-                request_deferred_callback(retry_after, True)
-            sleep_fn(retry_after)
-        if redirect_count >= MAX_AO3_REDIRECTS:
-            raise NetworkStopError("AO3 returned too many redirects")
-        # Only the same-work chapter hop skips the wait; any other redirect is
-        # paced like a fresh request. A Retry-After above has already been served.
-        paced = not _is_same_work_chapter_redirect(current_url, target)
-        current_url = target
-    raise NetworkStopError("AO3 redirect handling failed")
-
-
-DOTENV_PATH = DEFAULT_DOTENV_PATH
-
-
-def load_ao3_credential_pair(
-    environ: Mapping[str, str] | None = None,
-    *,
-    dotenv_path: Path | None = DOTENV_PATH,
-) -> AO3Credentials:
-    """Load credentials and keep the source name for failure diagnostics."""
-
-    try:
-        pair = load_ao3_credentials(environ, dotenv_path=dotenv_path)
-    except CredentialError as error:
-        raise AuthenticationFailure(str(error)) from error
-    # Registering here means every later log record is scrubbed, whatever
-    # code path happens to format a message.
-    register_secret(pair.username)
-    register_secret(pair.password)
-    return pair
-
-
-def load_environment_credentials(
-    environ: Mapping[str, str] | None = None,
-    *,
-    dotenv_path: Path | None = DOTENV_PATH,
-) -> tuple[str, str]:
-    """Load an explicitly selected credential pair without exposing either value."""
-
-    return load_ao3_credential_pair(environ, dotenv_path=dotenv_path).as_tuple()
-
-
-def _retry_while_transient(
-    perform: Callable[[], requests.Response],
-    *,
-    step: str,
-    delay_seconds: float,
-    sleep_fn: Callable[[float], None],
-    request_deferred_callback: Callable[[float, bool], None] | None,
-    max_transient_attempts: int,
-) -> requests.Response:
-    """Repeat a login request while AO3 returns a transient or origin failure.
-
-    A Cloudflare *challenge* is returned untouched for the caller to reject; a
-    challenge is a decision by Cloudflare, not a blip, and retrying it is what
-    gets an address blocked.
-    """
-
-    for attempt in range(1, max_transient_attempts + 1):
-        response = perform()
-        if response.status_code not in TRANSIENT_STATUS_CODES:
-            return response
-        if _is_cloudflare_challenge(response):
-            return response
-        detail = _cloudflare_origin_error(response, step) or (
-            f"AO3 returned a transient HTTP {response.status_code} at {step}"
-        )
-        if attempt >= max_transient_attempts:
-            suffix = f" after {attempt} attempts" if attempt > 1 else ""
-            raise AuthenticationFailure(f"{detail}{suffix}")
-        retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-        wait = (
-            retry_after
-            if retry_after is not None
-            else min(delay_seconds * (2.0 ** (attempt - 1)), TRANSIENT_MAX_BACKOFF_SECONDS)
-        )
-        LOGGER.warning(
-            f"{detail}; retrying in {format_duration(wait)} "
-            f"(attempt {attempt}/{max_transient_attempts})"
-        )
-        if request_deferred_callback is not None:
-            request_deferred_callback(wait, retry_after is not None)
-        sleep_fn(wait)
-    raise AuthenticationFailure(f"AO3 stayed unavailable at {step}")
-
-
-def login_authenticated_session(
-    session: requests.Session,
-    username: str,
-    password: str,
-    *,
-    source: str | None = None,
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-    max_transient_attempts: int = MAX_TRANSIENT_ATTEMPTS,
-    delay_seconds: float = DEFAULT_DELAY_SECONDS,
-    sleep_fn: Callable[[float], None] = time.sleep,
-    before_request: Callable[[], None] | None = None,
-    request_started_callback: Callable[[float], None] | None = None,
-    request_deferred_callback: Callable[[float, bool], None] | None = None,
-) -> None:
-    """Log in without exposing credentials or silently retrying failures."""
-
-    session.headers.update({
-        "User-Agent": "ao3-calibre-backfill/1.0 (sequential metadata refresh)",
-        "Accept": "text/html,application/xhtml+xml",
-    })
-    schedule_request = before_request or (lambda: None)
-    described_source = source or "the supplied credentials"
-    LOGGER.info(f"authenticating with credentials from {described_source}")
-    LOGGER.info("login step 1/2: requesting the AO3 token dispenser")
-    try:
-        token_response = _retry_while_transient(
-            lambda: _get_with_ao3_redirects(
-                session,
-                "https://archiveofourown.org/token_dispenser.json",
-                timeout_seconds=timeout_seconds,
-                before_request=schedule_request,
-                request_started_callback=request_started_callback,
-                request_deferred_callback=request_deferred_callback,
-                sleep_fn=sleep_fn,
-            ),
-            step="the token dispenser",
-            delay_seconds=delay_seconds,
-            sleep_fn=sleep_fn,
-            request_deferred_callback=request_deferred_callback,
-            max_transient_attempts=max_transient_attempts,
-        )
-    except requests.RequestException as error:
-        raise AuthenticationFailure(
-            f"AO3 token dispenser request failed to connect: {type(error).__name__}"
-        ) from error
-    if token_response.status_code != 200 or _is_cloudflare_challenge(token_response):
-        retry_after = _parse_retry_after(token_response.headers.get("Retry-After"))
-        if retry_after is not None and request_deferred_callback is not None:
-            request_deferred_callback(retry_after, True)
-        if _is_cloudflare_challenge(token_response):
-            raise AuthenticationFailure(
-                f"Cloudflare challenged the AO3 token dispenser (HTTP {token_response.status_code})"
-            )
-        raise AuthenticationFailure(
-            f"AO3 token dispenser returned HTTP {token_response.status_code}"
-            + (f"; Retry-After {retry_after:g}s" if retry_after is not None else "")
-        )
-    try:
-        token_value = token_response.json().get("token")
-    except (ValueError, AttributeError):
-        token_value = None
-    if not isinstance(token_value, str) or not token_value:
-        raise AuthenticationFailure(
-            "AO3 token dispenser returned HTTP 200 without a usable token value"
-        )
-    LOGGER.info("login step 1/2: token received")
-
-    if before_request is not None:
-        before_request()
-    else:
-        sleep_fn(delay_seconds)
-    if request_started_callback is not None:
-        request_started_callback(time.time())
-    payload = {
-        "user[login]": username,
-        "user[password]": password,
-        "user[remember_me]": "1",
-        "commit": "Log in",
-        "utf8": "\u2713",
-        "authenticity_token": token_value,
-    }
-    cookies_before_login = _auth_cookie_fingerprints(session)
-    LOGGER.info("login step 2/2: submitting the login form")
-
-    def submit_login() -> requests.Response:
-        return session.post(
-            "https://archiveofourown.org/users/login",
-            data=payload,
-            timeout=timeout_seconds,
-            allow_redirects=False,
-        )
-
-    try:
-        login_response = _retry_while_transient(
-            submit_login,
-            step="the login form",
-            delay_seconds=delay_seconds,
-            sleep_fn=sleep_fn,
-            request_deferred_callback=request_deferred_callback,
-            max_transient_attempts=max_transient_attempts,
-        )
-    except requests.RequestException as error:
-        raise AuthenticationFailure(
-            f"AO3 login POST failed to connect: {type(error).__name__}"
-        ) from error
-    if login_response.status_code in (307, 308):
-        raise AuthenticationFailure("AO3 login request used an unsafe redirect")
-    login_redirect = _redirect_target(
-        login_response,
-        "https://archiveofourown.org/users/login",
-    )
-    if login_redirect is not None:
-        redirect_retry_after = _parse_retry_after(login_response.headers.get("Retry-After"))
-        if redirect_retry_after is not None:
-            if request_deferred_callback is not None:
-                request_deferred_callback(redirect_retry_after, True)
-            sleep_fn(redirect_retry_after)
-        try:
-            login_response = _get_with_ao3_redirects(
-                session,
-                login_redirect,
-                timeout_seconds=timeout_seconds,
-                before_request=before_request or (lambda: sleep_fn(delay_seconds)),
-                request_started_callback=request_started_callback,
-                request_deferred_callback=request_deferred_callback,
-                sleep_fn=sleep_fn,
-            )
-        except requests.RequestException as error:
-            raise AuthenticationFailure(
-                f"AO3 login redirect request failed to connect: {type(error).__name__}"
-            ) from error
-    retry_after = _parse_retry_after(login_response.headers.get("Retry-After"))
-    if retry_after is not None and request_deferred_callback is not None and (
-        login_response.status_code != 200
-        or _is_cloudflare_challenge(login_response)
-        or _is_authentication_response(login_response)
-    ):
-        request_deferred_callback(retry_after, True)
-    status = login_response.status_code
-    destination = getattr(login_response, "url", None) or "<no final URL>"
-    LOGGER.info(f"login step 2/2: HTTP {status} at {destination}")
-    if _is_cloudflare_challenge(login_response):
-        raise AuthenticationFailure(f"Cloudflare challenged the AO3 login (HTTP {status})")
-    if status in (401, 403):
-        raise AuthenticationFailure(
-            f"AO3 refused the login with HTTP {status}; this is usually a rejected "
-            f"credential or a challenge page for {described_source}"
-        )
-    if _is_authentication_response(login_response):
-        raise CredentialsRejected(f"AO3 rejected the credentials from {described_source}")
-    if _is_final_login_response(login_response):
-        raise CredentialsRejected(
-            f"AO3 returned the login form again (HTTP {status}); the credentials "
-            f"from {described_source} were not accepted"
-        )
-    if status != 200:
-        raise AuthenticationFailure(f"AO3 login returned an unexpected HTTP {status}")
-    has_session_cookie = bool(_auth_cookie_fingerprints(session) - cookies_before_login)
-    has_logout_link = bool(
-        re.search(r"href=[\"'][^\"']*/users/logout(?:[\"'?]|$)", login_response.text, re.IGNORECASE)
-    )
-    has_logged_in_body = bool(
-        re.search(r"<body\b[^>]*\bclass=[\"'][^\"']*\blogged-in\b", login_response.text, re.IGNORECASE)
-    )
-    if not has_session_cookie and not has_logout_link and not has_logged_in_body:
-        raise AuthenticationFailure(
-            f"AO3 returned HTTP {status} at {destination} with no session cookie, "
-            "no logout link, and no logged-in body class"
-        )
-    evidence = ", ".join(
-        label
-        for label, present in (
-            ("session cookie", has_session_cookie),
-            ("logout link", has_logout_link),
-            ("logged-in body class", has_logged_in_body),
-        )
-        if present
-    )
-    LOGGER.info(f"authenticated session established ({evidence})")
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    if stripped.isdigit():
-        return float(stripped)
-    try:
-        retry_at = parsedate_to_datetime(stripped)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=timezone.utc)
-    return max(0.0, retry_at.timestamp() - time.time() + RETRY_AFTER_DATE_SKEW_SECONDS)
-
-
-class AO3Fetcher:
-    """Fetch AO3 work pages sequentially under the explicit request policy."""
-
-    def __init__(
-        self,
-        session: requests.Session | None = None,
-        *,
-        delay_seconds: float = DEFAULT_DELAY_SECONDS,
-        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        max_attempts: int = 4,
-        max_transient_attempts: int = MAX_TRANSIENT_ATTEMPTS,
-        max_rate_limit_attempts: int = MAX_RATE_LIMIT_ATTEMPTS,
-        sleep_fn: Callable[[float], None] = time.sleep,
-        monotonic_fn: Callable[[], float] = time.monotonic,
-        wall_time_fn: Callable[[], float] = time.time,
-        before_request: Callable[[], None] | None = None,
-        request_started_callback: Callable[[float], None] | None = None,
-        request_deferred_callback: Callable[[float, bool], None] | None = None,
-        reauthenticate: Callable[[], None] | None = None,
-        retry_unexpected_once: bool = False,
-    ) -> None:
-        if not math.isfinite(delay_seconds) or delay_seconds < MINIMUM_DELAY_SECONDS:
-            raise ValueError(f"delay_seconds must be at least {MINIMUM_DELAY_SECONDS:g}")
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be positive")
-        if max_transient_attempts < 1:
-            raise ValueError("max_transient_attempts must be positive")
-        if max_rate_limit_attempts < 1:
-            raise ValueError("max_rate_limit_attempts must be positive")
-        self.session = session or requests.Session()
-        self.delay_seconds = delay_seconds
-        self.timeout_seconds = timeout_seconds
-        self.max_attempts = max_attempts
-        self.max_transient_attempts = max_transient_attempts
-        self.max_rate_limit_attempts = max_rate_limit_attempts
-        self.sleep_fn = sleep_fn
-        self.monotonic_fn = monotonic_fn
-        self.wall_time_fn = wall_time_fn
-        self.before_request = before_request
-        self.request_started_callback = request_started_callback
-        self.request_deferred_callback = request_deferred_callback
-        self.reauthenticate = reauthenticate
-        self.retry_unexpected_once = retry_unexpected_once
-        self._last_request_at: float | None = None
-        self.last_request_wall_time: float | None = None
-        self.session.headers.update({
-            "User-Agent": "ao3-calibre-backfill/1.0 (sequential metadata refresh)",
-            "Accept": "text/html,application/xhtml+xml",
-        })
-
-    def _before_request(self) -> None:
-        if self.before_request is not None:
-            self.before_request()
-            return
-        now = self.monotonic_fn()
-        if self._last_request_at is not None:
-            remaining = self.delay_seconds - (now - self._last_request_at)
-            if remaining > 0:
-                self.sleep_fn(remaining)
-        self._last_request_at = self.monotonic_fn()
-
-    def _transient_backoff(self, attempts: int) -> float:
-        return min(
-            self.delay_seconds * (2.0 ** (attempts - 1)),
-            TRANSIENT_MAX_BACKOFF_SECONDS,
-        )
-
-    def _wait_for_retry(self, seconds: float, *, exact: bool = False) -> None:
-        LOGGER.warning(
-            f"waiting {format_duration(seconds)} before retrying"
-            + (" (server Retry-After)" if exact else " (backoff)")
-        )
-        if self.request_deferred_callback is not None:
-            self.request_deferred_callback(seconds, exact)
-        self.sleep_fn(seconds)
-        # Retry-After is the server's exact requested wait. Do not add the
-        # normal inter-work delay after that wait.
-        self._last_request_at = None
-
-    def _request_started(self, timestamp: float) -> None:
-        self.last_request_wall_time = timestamp
-        if self.request_started_callback is not None:
-            self.request_started_callback(timestamp)
-
-    def _redirect_deferred(self, seconds: float, exact: bool) -> None:
-        if self.request_deferred_callback is not None:
-            self.request_deferred_callback(seconds, exact)
-        self._last_request_at = None
-
-    def _request_work_page(self, work_url: str) -> requests.Response:
-        return _get_with_ao3_redirects(
-            self.session,
-            work_url,
-            timeout_seconds=self.timeout_seconds,
-            before_request=self._before_request,
-            request_started_callback=self._request_started,
-            request_deferred_callback=self._redirect_deferred,
-            sleep_fn=self.sleep_fn,
-            wall_time_fn=self.wall_time_fn,
-        )
-
-    def fetch(self, work_id: str) -> AO3FetchRecord:
-        work_url = canonical_work_url(work_id)
-        transient_attempts = 0
-        cloudflare_count = 0
-        rate_limit_count = 0
-        reauthentication_attempted = False
-        unexpected_html_attempts = 0
-
-        for attempt in range(
-            self.max_attempts + self.max_transient_attempts + self.max_rate_limit_attempts
-        ):
-            try:
-                response = self._request_work_page(work_url)
-            except requests.RequestException as error:
-                transient_attempts += 1
-                if transient_attempts >= self.max_transient_attempts:
-                    raise NetworkStopError(
-                        f"repeated transient AO3 request failures ({type(error).__name__})"
-                    ) from error
-                self._wait_for_retry(self._transient_backoff(transient_attempts))
-                continue
-
-            if _is_cloudflare_challenge(response):
-                cloudflare_count += 1
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                if cloudflare_count >= 2:
-                    if retry_after is not None:
-                        self._wait_for_retry(retry_after, exact=True)
-                    raise RepeatedCloudflare(f"AO3 returned repeated Cloudflare responses for work {work_id}")
-                self._wait_for_retry(
-                    retry_after
-                    if retry_after is not None
-                    else self.delay_seconds * (2.0 ** (cloudflare_count - 1)),
-                    exact=retry_after is not None,
-                )
-                continue
-
-            if _is_login_redirect(response) or _is_authentication_response(response):
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                if retry_after is not None:
-                    self._wait_for_retry(retry_after, exact=True)
-                if self.reauthenticate is not None and not reauthentication_attempted:
-                    reauthentication_attempted = True
-                    LOGGER.warning(
-                        f"AO3 asked for authentication on work {work_id}; reauthenticating once"
-                    )
-                    self.reauthenticate()
-                    continue
-                raise AuthenticationFailure(f"AO3 authentication failure for work {work_id}")
-
-            if response.status_code == 429:
-                rate_limit_count += 1
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                wait = (
-                    retry_after
-                    if retry_after is not None
-                    else self._transient_backoff(rate_limit_count)
-                )
-                LOGGER.warning(
-                    f"AO3 rate-limited work {work_id}; waiting {format_duration(wait)} "
-                    f"({'exact Retry-After' if retry_after is not None else 'backoff'}, "
-                    f"attempt {rate_limit_count}/{self.max_rate_limit_attempts})"
-                )
-                if rate_limit_count >= self.max_rate_limit_attempts:
-                    if retry_after is not None:
-                        self._wait_for_retry(retry_after, exact=True)
-                    raise RepeatedRateLimit(
-                        f"AO3 rate-limited work {work_id} {rate_limit_count} times in a row; "
-                        "consider raising --delay"
-                    )
-                self._wait_for_retry(wait, exact=retry_after is not None)
-                continue
-
-            if response.status_code in (404, 410):
-                response_url = getattr(response, "url", None)
-                if not isinstance(response_url, str) or not _is_work_response_url(response_url, work_id):
-                    raise UnexpectedHTML("AO3 unavailable response URL was not the requested work route")
-                return AO3FetchRecord(
-                    work_id=work_id,
-                    work_url=work_url,
-                    fetched_at=_utc_now(),
-                    availability="unavailable",
-                    http_status=response.status_code,
-                    error=f"AO3 returned HTTP {response.status_code}",
-                )
-
-            if response.status_code in TRANSIENT_STATUS_CODES:
-                transient_attempts += 1
-                origin_error = _cloudflare_origin_error(response, f"work {work_id}")
-                if origin_error is not None:
-                    LOGGER.warning(origin_error)
-                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
-                if transient_attempts >= self.max_transient_attempts:
-                    if retry_after is not None:
-                        self._wait_for_retry(retry_after, exact=True)
-                    raise NetworkStopError(
-                        f"AO3 returned {transient_attempts} consecutive transient "
-                        f"HTTP {response.status_code} responses for work {work_id}"
-                    )
-                self._wait_for_retry(
-                    retry_after
-                    if retry_after is not None
-                    else self._transient_backoff(transient_attempts),
-                    exact=retry_after is not None,
-                )
-                continue
-
-            if response.status_code != 200:
-                raise NetworkStopError(f"AO3 returned unexpected HTTP {response.status_code}")
-
-            content_type = response.headers.get("Content-Type", "").casefold()
-            if content_type and not content_type.startswith("text/html"):
-                raise UnexpectedHTML("AO3 returned a non-HTML response for a work page")
-            response_url = getattr(response, "url", None)
-            if not isinstance(response_url, str) or not _is_work_response_url(response_url, work_id):
-                raise UnexpectedHTML("AO3 response URL was not the requested work route")
-            try:
-                return _metadata_from_page(response.text, work_url, response.status_code, response_url)
-            except UnexpectedHTML as error:
-                if self.retry_unexpected_once and unexpected_html_attempts == 0:
-                    unexpected_html_attempts += 1
-                    LOGGER.warning(f"work {work_id}: {error}; retrying once")
-                    self._wait_for_retry(self.delay_seconds)
-                    continue
-                destination = response_url or "<no final URL>"
-                raise UnexpectedHTML(
-                    f"work {work_id}: HTTP {response.status_code} response at {destination} "
-                    f"was not a recognized AO3 work page: {error}"
-                ) from error
-
-        raise NetworkStopError(f"Could not fetch AO3 work {work_id}")
-
-
 def _unique_work_ids(report: ScanReport, include_ambiguous: bool) -> list[str]:
     ambiguous_ids = {mapping.work_id for mapping in report.ambiguous_mappings}
     result: list[str] = []
@@ -2134,124 +1008,6 @@ def render_refresh_preview(
     return "\n".join(lines)
 
 
-def verify_custom_columns(calibredb: str, library: Path) -> dict[str, dict[str, object]]:
-    """Verify the required schema through both calibredb and SQLite."""
-
-    details_output = run_calibredb(calibredb, library, "custom_columns", "--details")
-    details = parse_custom_column_details(details_output)
-    sqlite_columns = read_custom_columns_sqlite(library)
-    verified: dict[str, dict[str, object]] = {}
-    for label, name, datatype, _ in CUSTOM_COLUMNS:
-        detail = details.get(label)
-        if detail is None:
-            raise ColumnConfigurationError(f"Calibre column #{label} is missing from calibredb output")
-        actual_type = str(detail.get("datatype", ""))
-        if actual_type != datatype:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} has datatype {actual_type!r}; expected {datatype!r}"
-            )
-        if str(detail.get("name", "")) != name:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} has display name {detail.get('name')!r}; expected {name!r}"
-            )
-        sqlite_column = sqlite_columns.get(label)
-        if sqlite_column is None:
-            raise ColumnConfigurationError(f"Calibre column #{label} is missing from metadata.db")
-        if sqlite_column["datatype"] != datatype:
-            raise ColumnConfigurationError(
-                f"metadata.db column #{label} has datatype {sqlite_column['datatype']!r}; expected {datatype!r}"
-            )
-        verified[label] = {**detail, "sqlite_id": sqlite_column["id"]}
-    return verified
-
-
-def verify_local_metric_columns(calibredb: str, library: Path) -> dict[str, dict[str, object]]:
-    """Verify the existing local Words/Gfog columns through both interfaces."""
-
-    details = parse_custom_column_details(
-        run_calibredb(calibredb, library, "custom_columns", "--details")
-    )
-    sqlite_columns = read_custom_columns_sqlite(library)
-    verified: dict[str, dict[str, object]] = {}
-    for label, name, datatype, _ in LOCAL_METRIC_COLUMNS:
-        detail = details.get(label)
-        if detail is None:
-            raise ColumnConfigurationError(f"Calibre column #{label} is missing from calibredb output")
-        if str(detail.get("datatype", "")) != datatype:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} has datatype {detail.get('datatype')!r}; expected {datatype!r}"
-            )
-        if str(detail.get("name", "")) != name:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} has display name {detail.get('name')!r}; expected {name!r}"
-            )
-        sqlite_column = sqlite_columns.get(label)
-        if sqlite_column is None or sqlite_column["datatype"] != datatype:
-            raise ColumnConfigurationError(
-                f"metadata.db column #{label} is missing or has the wrong datatype"
-            )
-        verified[label] = {**detail, "sqlite_id": sqlite_column["id"]}
-    return verified
-
-
-def parse_custom_column_details(output: str) -> dict[str, dict[str, object]]:
-    """Parse Calibre 9.x's human-readable ``--details`` output."""
-
-    lines = output.splitlines()
-    result: dict[str, dict[str, object]] = {}
-    for index, line in enumerate(lines):
-        label = line.strip()
-        if not label or label.startswith("{"):
-            continue
-        next_index = index + 1
-        while next_index < len(lines) and not lines[next_index].strip():
-            next_index += 1
-        if next_index >= len(lines) or not lines[next_index].lstrip().startswith("{"):
-            continue
-        value: object | None = None
-        for end_index in range(next_index + 1, len(lines) + 1):
-            candidate = "\n".join(lines[next_index:end_index])
-            try:
-                value = ast.literal_eval(candidate)
-            except (SyntaxError, ValueError):
-                continue
-            break
-        if not isinstance(value, dict):
-            continue
-        if isinstance(value.get("label"), str):
-            parsed_label = str(value["label"]).removeprefix("#")
-            result[parsed_label] = {str(key): item for key, item in value.items()}
-    return result
-
-
-def read_custom_columns_sqlite(library: Path) -> dict[str, dict[str, object]]:
-    database = library / "metadata.db"
-    if not database.is_file():
-        raise ColumnConfigurationError(f"Calibre metadata.db does not exist: {database}")
-    uri = f"file:{urllib.parse.quote(str(database), safe='/')}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
-        rows = connection.execute(
-            "SELECT id, label, name, datatype FROM custom_columns ORDER BY id"
-        ).fetchall()
-    return {
-        str(row[1]): {"id": row[0], "label": row[1], "name": row[2], "datatype": row[3]}
-        for row in rows
-    }
-
-
-def read_library_uuid(library: Path) -> str:
-    database = library / "metadata.db"
-    uri = f"file:{urllib.parse.quote(str(database), safe='/')}?mode=ro"
-    try:
-        with sqlite3.connect(uri, uri=True) as connection:
-            row = connection.execute("SELECT uuid FROM library_id LIMIT 1").fetchone()
-    except sqlite3.Error as error:
-        raise BackfillError(f"Could not read the Calibre library UUID: {error}") from error
-    if row is None or not row[0]:
-        raise BackfillError(f"Calibre metadata.db has no library UUID: {database}")
-    return str(row[0])
-
-
 def verify_report_library(report: ScanReport, library: Path) -> None:
     if Path(report.library).resolve() != library.resolve():
         raise BackfillError(
@@ -2260,260 +1016,6 @@ def verify_report_library(report: ScanReport, library: Path) -> None:
     current_uuid = read_library_uuid(library)
     if not report.library_uuid or report.library_uuid != current_uuid:
         raise BackfillError("Scan report library UUID does not match the current metadata.db")
-
-
-def running_calibre_processes() -> tuple[str, ...]:
-    result = subprocess.run(
-        ["ps", "-eo", "pid=,comm=,args="],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=sanitized_child_environment(),
-    )
-    matches: list[str] = []
-    for line in result.stdout.splitlines():
-        fields = line.strip().split(None, 2)
-        if len(fields) < 3:
-            continue
-        pid, comm, command = fields
-        if pid == str(os.getpid()):
-            continue
-        process_name = comm.casefold()
-        process_names = {
-            "calibre",
-            "calibre-parallel",
-            "calibre-server",
-            "calibre-web",
-            "calibreweb",
-            "calibredb",
-        }
-        if process_name in process_names:
-            matches.append(line.strip())
-            continue
-        try:
-            command_tokens = shlex.split(command)
-        except ValueError:
-            command_tokens = command.split()
-        executable_tokens = command_tokens
-        if any(
-            Path(token).name.casefold() in process_names
-            or "calibre-web" in token.casefold()
-            or "calibreweb" in token.casefold()
-            for token in executable_tokens
-        ):
-            matches.append(line.strip())
-    return tuple(matches)
-
-
-def require_calibre_closed() -> None:
-    processes = running_calibre_processes()
-    if processes:
-        raise CalibreInUseError(
-            "Close Calibre and Calibre-Web before changing metadata.db:\n" + "\n".join(processes)
-        )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _backup_manifest_path(backup_path: Path) -> Path:
-    return backup_path.with_name(f"{backup_path.name}.manifest.json")
-
-
-def _validate_sqlite_backup(backup_path: Path, library_uuid: str) -> None:
-    uri = f"file:{urllib.parse.quote(str(backup_path), safe='/')}?mode=ro"
-    try:
-        with sqlite3.connect(uri, uri=True) as connection:
-            integrity = connection.execute("PRAGMA integrity_check").fetchone()
-            if integrity is None or integrity[0] != "ok":
-                raise BackfillError(f"Backup failed SQLite integrity_check: {backup_path}")
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            required_tables = {"books", "custom_columns", "library_id"}
-            if not required_tables.issubset(tables):
-                raise BackfillError(f"Backup is not a Calibre metadata database: {backup_path}")
-            row = connection.execute("SELECT uuid FROM library_id LIMIT 1").fetchone()
-    except sqlite3.Error as error:
-        raise BackfillError(f"Backup is not a readable SQLite database: {backup_path}") from error
-    if row is None or row[0] != library_uuid:
-        raise BackfillError(f"Backup belongs to a different Calibre library: {backup_path}")
-
-
-def verify_backup(backup_path: Path, library: Path) -> None:
-    source = library / "metadata.db"
-    if backup_path.resolve() == source.resolve():
-        raise BackfillError("Backup path must not be metadata.db itself")
-    if not backup_path.is_file() or backup_path.stat().st_size <= 0:
-        raise BackfillError(f"Backup is missing or empty: {backup_path}")
-    try:
-        if os.path.samefile(source, backup_path):
-            raise BackfillError("Backup must be an independent copy of metadata.db")
-    except FileNotFoundError:
-        pass
-    manifest_path = _backup_manifest_path(backup_path)
-    if not manifest_path.is_file():
-        raise BackfillError(f"Backup provenance manifest is missing: {manifest_path}")
-    try:
-        with manifest_path.open(encoding="utf-8") as stream:
-            manifest = json.load(stream)
-    except (OSError, json.JSONDecodeError) as error:
-        raise BackfillError(f"Backup provenance manifest is invalid: {manifest_path}") from error
-    if not isinstance(manifest, dict):
-        raise BackfillError(f"Backup provenance manifest is not an object: {manifest_path}")
-    if manifest.get("source_path") != str(source.resolve()):
-        raise BackfillError(f"Backup provenance points to a different library: {backup_path}")
-    if not source.is_file() or source.stat().st_size <= 0:
-        raise BackfillError(f"Current metadata.db is missing or empty: {source}")
-    if manifest.get("source_size") != source.stat().st_size:
-        raise BackfillError(f"Backup source size differs from the current library: {backup_path}")
-    if manifest.get("source_sha256") != _sha256_file(source):
-        raise BackfillError(f"Backup source checksum differs from the current library: {backup_path}")
-    if manifest.get("backup_size") != backup_path.stat().st_size:
-        raise BackfillError(f"Backup size differs from its provenance manifest: {backup_path}")
-    if manifest.get("backup_sha256") != _sha256_file(backup_path):
-        raise BackfillError(f"Backup checksum differs from its provenance manifest: {backup_path}")
-    library_uuid = read_library_uuid(library)
-    if manifest.get("library_uuid") != library_uuid:
-        raise BackfillError(f"Backup library UUID differs from the current library: {backup_path}")
-    _validate_sqlite_backup(backup_path, library_uuid)
-
-
-def create_backup(library: Path, destination: Path) -> Path:
-    require_calibre_closed()
-    source = library / "metadata.db"
-    if not source.is_file() or source.stat().st_size <= 0:
-        raise BackfillError(f"metadata.db is missing or empty: {source}")
-    if destination.resolve() == source.resolve():
-        raise BackfillError("Backup destination must not be metadata.db itself")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or _backup_manifest_path(destination).exists():
-        raise BackfillError(
-            f"Backup destination already exists; choose a new destination explicitly: {destination}"
-        )
-    source_size = source.stat().st_size
-    source_sha256 = _sha256_file(source)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    try:
-        shutil.copy2(source, temporary)
-        if temporary.stat().st_size <= 0:
-            raise BackfillError(f"Backup copy is empty: {temporary}")
-        library_uuid = read_library_uuid(library)
-        _validate_sqlite_backup(temporary, library_uuid)
-        if source.stat().st_size != source_size or _sha256_file(source) != source_sha256:
-            raise BackfillError("metadata.db changed while the backup was being created")
-        try:
-            os.link(temporary, destination)
-        except FileExistsError as error:
-            raise BackfillError(
-                f"Backup destination appeared during creation; refusing to overwrite: {destination}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
-    _write_json_atomically(
-        _backup_manifest_path(destination),
-        {
-            "schema_version": 1,
-            "source_path": str(source.resolve()),
-            "source_size": source_size,
-            "source_sha256": source_sha256,
-            "backup_size": destination.stat().st_size,
-            "backup_sha256": _sha256_file(destination),
-            "library_uuid": library_uuid,
-            "created_at": _utc_now(),
-        },
-    )
-    verify_backup(destination, library)
-    return destination
-
-
-def setup_custom_columns(calibredb: str, library: Path, backup_path: Path) -> tuple[str, ...]:
-    """Create missing columns only after the backup and process gates pass."""
-
-    require_calibre_closed()
-    verify_backup(backup_path, library)
-    existing = read_custom_columns_sqlite(library)
-    for label, name, datatype, _ in CUSTOM_COLUMNS:
-        current = existing.get(label)
-        if current is None:
-            continue
-        if current["datatype"] != datatype:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} exists as {current['datatype']!r}, expected {datatype!r}"
-            )
-        if current["name"] != name:
-            raise ColumnConfigurationError(
-                f"Calibre column #{label} exists with display name {current['name']!r}, expected {name!r}"
-            )
-
-    created: list[str] = []
-    for label, name, datatype, _ in CUSTOM_COLUMNS:
-        if label in existing:
-            continue
-        run_calibredb(calibredb, library, "add_custom_column", label, name, datatype)
-        created.append(label)
-    verify_custom_columns(calibredb, library)
-    return tuple(created)
-
-
-class _Cooldown:
-    """Escalating pauses for problems that affect every work, not one."""
-
-    def __init__(
-        self,
-        sleep_fn: Callable[[float], None],
-        schedule: Sequence[float] = COOLDOWN_SCHEDULE_SECONDS,
-    ) -> None:
-        self.sleep_fn = sleep_fn
-        self.schedule = tuple(schedule)
-        self.level = 0
-        self.count = 0
-        self.total_seconds = 0.0
-
-    def reset(self) -> None:
-        self.level = 0
-
-    def wait(self, reason: str) -> None:
-        seconds = self.schedule[min(self.level, len(self.schedule) - 1)]
-        self.level += 1
-        self.count += 1
-        self.total_seconds += seconds
-        resume_at = datetime.now().astimezone() + timedelta(seconds=seconds)
-        LOGGER.warning(
-            f"{reason}; cooling down {format_duration(seconds)} "
-            f"(until {format_clock(resume_at)}), then retrying"
-        )
-        self.sleep_fn(seconds)
-
-
-# Errors that describe AO3 or the session as a whole. Each gets a cool-down and
-# one more attempt at the same work before it is treated as that work's fault.
-SYSTEMIC_FETCH_ERRORS = (RepeatedCloudflare, RepeatedRateLimit, AuthenticationFailure)
-
-
-def _sign_in_patiently(sign_in: Callable[[], None], cooldown: _Cooldown) -> None:
-    """Keep trying to sign in through transient trouble, but never past bad credentials."""
-
-    while True:
-        try:
-            sign_in()
-        except CredentialsRejected:
-            raise
-        except (NetworkStopError, requests.RequestException) as error:
-            cooldown.wait(f"sign-in failed: {error}")
-            continue
-        # Deliberately no cooldown.reset(): a working login page does not prove
-        # work pages are back. Only a cached work resets the escalation, so a
-        # lasting outage settles into long pauses instead of draining the queue.
-        return
 
 
 def fetch_pending(
@@ -2619,10 +1121,10 @@ def fetch_pending(
             summary_every=PROGRESS_SUMMARY_EVERY,
         )
         authenticated_session: requests.Session | None = None
-        cooldown = _Cooldown(sleep_fn)
+        cooldown = Cooldown(sleep_fn)
         failed_this_run: dict[str, str] = {}
         try:
-            credentials = load_ao3_credential_pair() if use_env_credentials else None
+            credentials = load_run_credentials() if use_env_credentials else None
             sign_in: Callable[[], None] | None = None
             if credentials is not None:
                 session = requests.Session()
@@ -2642,7 +1144,7 @@ def fetch_pending(
                     )
 
                 if keep_going:
-                    _sign_in_patiently(sign_in, cooldown)
+                    sign_in_patiently(sign_in, cooldown)
                 else:
                     sign_in()
 
@@ -2651,7 +1153,7 @@ def fetch_pending(
                     return
                 # Start from a clean jar so a half-expired session cannot linger.
                 authenticated_session.cookies.clear()
-                _sign_in_patiently(sign_in, cooldown)
+                sign_in_patiently(sign_in, cooldown)
 
             if fetcher is not None:
                 active_fetcher = fetcher
@@ -2746,7 +1248,7 @@ def fetch_pending(
 
 def _log_keep_going_summary(
     cache: CacheStore,
-    cooldown: _Cooldown,
+    cooldown: Cooldown,
     failed_this_run: Mapping[str, str],
 ) -> None:
     if cooldown.count:
@@ -2917,27 +1419,6 @@ def verify_report_inputs(
     LOGGER.info(f"revalidated {len(selected_mappings)} EPUBs; the scan still matches the library")
 
 
-def load_local_metric_values(calibredb: str, library: Path) -> dict[int, dict[str, object]]:
-    output = run_calibredb(
-        calibredb,
-        library,
-        "list",
-        "--for-machine",
-        "--fields",
-        "id,*words,*gfog",
-    )
-    books = json.loads(output)
-    if not isinstance(books, list):
-        raise BackfillError("calibredb returned an unexpected local metric value list")
-    result: dict[int, dict[str, object]] = {}
-    for book in books:
-        if not isinstance(book, dict) or not str(book.get("id", "")).isdigit():
-            continue
-        book_id = int(cast(str | int, book["id"]))
-        result[book_id] = {label: book.get(f"*{label}") for label, _, _, _ in LOCAL_METRIC_COLUMNS}
-    return result
-
-
 def calculate_missing_local_metrics(
     report: ScanReport,
     library: Path,
@@ -3010,19 +1491,19 @@ def _backup_epub_once(epub_path: Path, backup_path: Path) -> None:
             raise BackfillError(f"EPUB backup manifest is invalid: {manifest_path}")
         if manifest.get("backup_size") != backup_path.stat().st_size:
             raise BackfillError(f"EPUB backup size differs from its manifest: {backup_path}")
-        if manifest.get("backup_sha256") != _sha256_file(backup_path):
+        if manifest.get("backup_sha256") != sha256_file(backup_path):
             raise BackfillError(f"EPUB backup checksum differs from its manifest: {backup_path}")
         return
 
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     source_size = epub_path.stat().st_size
-    source_sha256 = _sha256_file(epub_path)
+    source_sha256 = sha256_file(epub_path)
     shutil.copy2(epub_path, backup_path)
-    if epub_path.stat().st_size != source_size or _sha256_file(epub_path) != source_sha256:
+    if epub_path.stat().st_size != source_size or sha256_file(epub_path) != source_sha256:
         raise BackfillError(f"EPUB changed while its backup was being created: {epub_path}")
-    if backup_path.stat().st_size != source_size or _sha256_file(backup_path) != source_sha256:
+    if backup_path.stat().st_size != source_size or sha256_file(backup_path) != source_sha256:
         raise BackfillError(f"EPUB backup does not match its source: {backup_path}")
-    _write_json_atomically(
+    write_json_atomically(
         manifest_path,
         {
             "schema_version": 1,
@@ -3030,8 +1511,8 @@ def _backup_epub_once(epub_path: Path, backup_path: Path) -> None:
             "source_size": source_size,
             "source_sha256": source_sha256,
             "backup_size": backup_path.stat().st_size,
-            "backup_sha256": _sha256_file(backup_path),
-            "created_at": _utc_now(),
+            "backup_sha256": sha256_file(backup_path),
+            "created_at": utc_now(),
         },
     )
 
@@ -3187,84 +1668,6 @@ def enrich_existing_epubs(
     }
 
 
-def _read_custom_values_calibredb(
-    calibredb: str,
-    library: Path,
-    labels: Sequence[str],
-) -> dict[int, dict[str, object]]:
-    output = run_calibredb(
-        calibredb,
-        library,
-        "list",
-        "--for-machine",
-        "--fields",
-        ",".join(("id", *(f"*{label}" for label in labels))),
-    )
-    books = json.loads(output)
-    if not isinstance(books, list):
-        raise BackfillError("calibredb returned an unexpected custom value list")
-    result: dict[int, dict[str, object]] = {}
-    for book in books:
-        if not isinstance(book, dict) or not str(book.get("id", "")).isdigit():
-            continue
-        book_id = int(cast(str | int, book["id"]))
-        result[book_id] = {label: book.get(f"*{label}") for label in labels}
-    return result
-
-
-def _read_custom_values_sqlite(
-    library: Path,
-    labels: Sequence[str],
-) -> dict[int, dict[str, object]]:
-    columns = read_custom_columns_sqlite(library)
-    database = library / "metadata.db"
-    uri = f"file:{urllib.parse.quote(str(database), safe='/')}?mode=ro"
-    result: dict[int, dict[str, object]] = {}
-    with sqlite3.connect(uri, uri=True) as connection:
-        for label in labels:
-            column = columns.get(label)
-            if column is None:
-                raise ColumnConfigurationError(f"Calibre column #{label} is missing from metadata.db")
-            column_id = int(cast(int, column["id"]))
-            table = f"custom_column_{column_id}"
-            if column["datatype"] == "text":
-                rows = connection.execute(
-                    f"SELECT link.book, values_table.value "
-                    f"FROM books_custom_column_{column_id}_link AS link "
-                    f"JOIN {table} AS values_table ON values_table.id = link.value"
-                ).fetchall()
-            else:
-                rows = connection.execute(f"SELECT book, value FROM {table}").fetchall()
-            for book_id, value in rows:
-                result.setdefault(int(book_id), {})[label] = value
-    return result
-
-
-def verify_written_values(
-    calibredb: str,
-    library: Path,
-    expected: dict[str, dict[str, str]],
-) -> dict[str, int]:
-    """Read written values back through calibredb and read-only SQLite."""
-
-    if not expected:
-        return {"books": 0, "fields": 0}
-    require_calibre_closed()
-    labels = tuple(sorted({label for fields in expected.values() for label in fields}))
-    calibredb_values = _read_custom_values_calibredb(calibredb, library, labels)
-    sqlite_values = _read_custom_values_sqlite(library, labels)
-    for book_id_text, fields in expected.items():
-        book_id = int(book_id_text)
-        for label, value in fields.items():
-            actual_calibre = calibredb_values.get(book_id, {}).get(label)
-            actual_sqlite = sqlite_values.get(book_id, {}).get(label)
-            if str(actual_calibre) != value or str(actual_sqlite) != value:
-                raise BackfillError(
-                    f"Post-write verification failed for book {book_id} column #{label}"
-                )
-    return {"books": len(expected), "fields": sum(len(fields) for fields in expected.values())}
-
-
 def write_calibre_values(
     report: ScanReport,
     cache: CacheStore,
@@ -3277,8 +1680,18 @@ def write_calibre_values(
     include_ambiguous: bool = False,
     write_local_metrics: bool = False,
     replace_local_metrics: bool = False,
+    calibre_debug: str = "calibre-debug",
+    bulk_writer: Callable[
+        [str, Path, Mapping[str, Mapping[int, object]], Mapping[str, str]], tuple[str, ...]
+    ] = run_calibre_bulk_write,
 ) -> dict[str, object]:
-    """Write approved AO3/category values and optionally blank local metrics."""
+    """Write approved AO3/category values and optionally blank local metrics.
+
+    Selection is unchanged from the per-field ``calibredb`` writer: only ``ok``
+    records, never an empty value, and local metrics only into blank cells
+    unless replacement is requested. The values are then written column by
+    column through Calibre's API in a single ``calibre-debug`` process.
+    """
 
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive when specified")
@@ -3311,7 +1724,12 @@ def write_calibre_values(
     failed: list[dict[str, object]] = []
     skipped_unavailable: list[int] = []
     skipped_without_values: list[int] = []
-    written_values: dict[str, dict[str, str]] = {}
+    planned_values: dict[str, dict[str, str]] = {}
+    plan: dict[str, dict[int, object]] = {}
+    datatypes = {
+        label: datatype
+        for label, _, datatype, _ in (*AO3_COLUMNS, *LOCAL_METRIC_COLUMNS)
+    }
     seen_book_ids: set[int] = set()
     for mapping, record in candidates:
         if mapping.book_id in seen_book_ids:
@@ -3320,11 +1738,11 @@ def write_calibre_values(
         if record.availability != "ok":
             skipped_unavailable.append(mapping.book_id)
             continue
-        fields_to_write: list[tuple[str, str]] = []
-        for label, _, _, attribute in BACKFILL_CUSTOM_COLUMNS:
+        fields_to_write: list[tuple[str, object]] = []
+        for label, _, _, attribute in AO3_COLUMNS:
             value = getattr(record, attribute)
             if value is not None and value != "":
-                fields_to_write.append((label, str(value)))
+                fields_to_write.append((label, value))
         if write_local_metrics:
             existing = current_local_values.get(mapping.book_id, {})
             for label, _, _, attribute in LOCAL_METRIC_COLUMNS:
@@ -3335,40 +1753,41 @@ def write_calibre_values(
                     continue
                 if not replace_local_metrics and existing.get(label) not in (None, ""):
                     continue
-                fields_to_write.append((label, str(value)))
+                fields_to_write.append((label, value))
         if not fields_to_write:
             skipped_without_values.append(mapping.book_id)
             continue
-        written_fields: list[str] = []
+        planned_values[str(mapping.book_id)] = {label: str(value) for label, value in fields_to_write}
+        for label, value in fields_to_write:
+            plan.setdefault(label, {})[mapping.book_id] = value
+        updated.append(mapping.book_id)
+
+    written_values = planned_values
+    if plan:
+        LOGGER.info(
+            f"writing {sum(len(values) for values in plan.values())} values for "
+            f"{len(updated)} books across {len(plan)} columns through Calibre's API"
+        )
+        require_calibre_closed()
         try:
-            require_calibre_closed()
-            for label, value in fields_to_write:
-                run_calibredb(
-                    calibredb,
-                    library,
-                    "set_custom",
-                    label,
-                    str(mapping.book_id),
-                    value,
-                )
-                written_fields.append(label)
-        except CalibreInUseError:
-            raise
-        except (BackfillError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-            written_values[str(mapping.book_id)] = {
-                label: value for label, value in fields_to_write if label in written_fields
+            bulk_writer(calibre_debug, library, plan, datatypes)
+        except BulkWriteError as error:
+            # Each column is written in one call, so a failure leaves the
+            # columns finished before it fully written and the rest untouched.
+            completed = set(error.completed)
+            written_values = {
+                book_id: {label: value for label, value in fields.items() if label in completed}
+                for book_id, fields in planned_values.items()
             }
+            written_values = {book_id: fields for book_id, fields in written_values.items() if fields}
+            updated = [int(book_id) for book_id in written_values]
             failed.append(
                 {
-                    "book_id": mapping.book_id,
-                    "work_id": mapping.work_id,
                     "error": str(error),
-                    "partially_written_fields": written_fields,
+                    "completed_columns": sorted(completed),
+                    "incomplete_columns": sorted(set(plan) - completed),
                 }
             )
-            break
-        written_values[str(mapping.book_id)] = dict(fields_to_write)
-        updated.append(mapping.book_id)
 
     return {
         "updated": updated,
@@ -3382,64 +1801,6 @@ def write_calibre_values(
             if mapping.work_id not in records
         ],
         "failed": failed,
-    }
-
-
-def verify_library_values(calibredb: str, library: Path) -> dict[str, object]:
-    """Read custom values and exercise Calibre's numeric search/sort paths."""
-
-    verify_custom_columns(calibredb, library)
-    field_names = ",".join(f"*{label}" for label, _, _, _ in CUSTOM_COLUMNS)
-    output = run_calibredb(
-        calibredb,
-        library,
-        "list",
-        "--for-machine",
-        "--fields",
-        f"id,title,{field_names}",
-    )
-    books = json.loads(output)
-    if not isinstance(books, list):
-        raise BackfillError("calibredb returned an unexpected value list")
-    populated: dict[str, int] = {}
-    for label, _, _, _ in CUSTOM_COLUMNS:
-        populated[label] = sum(
-            1
-            for book in books
-            if isinstance(book, dict) and book.get(f"*{label}") not in (None, "")
-        )
-
-    search_query = "#ao3_kudos:>100"
-    try:
-        search_output = run_calibredb(calibredb, library, "search", search_query)
-    except RuntimeError as error:
-        if "No books matching the search expression" not in str(error):
-            raise
-        search_output = ""
-    sorted_output = run_calibredb(
-        calibredb,
-        library,
-        "list",
-        "--for-machine",
-        "--search",
-        search_query,
-        "--sort-by",
-        "*ao3_kudos",
-        "--fields",
-        "id,title,*ao3_kudos",
-    )
-    sorted_books = json.loads(sorted_output)
-    sample = []
-    if isinstance(sorted_books, list):
-        for book in sorted_books[:5]:
-            if isinstance(book, dict):
-                sample.append(book)
-    return {
-        "book_count": len(books),
-        "populated": populated,
-        "numeric_search": search_query,
-        "numeric_search_result_count": len([line for line in search_output.splitlines() if line.strip()]),
-        "sorted_sample": sample,
     }
 
 
@@ -3489,7 +1850,7 @@ def _path_inside(path: Path, parent: Path) -> bool:
 
 
 def _ensure_cache_location(cache_dir: Path, library: Path) -> None:
-    protected = (library, Path(__file__).resolve().parent, Path("/home/drifter/repos/ao3downloadernew"))
+    protected = (library, REPO_ROOT, Path("/home/drifter/repos/ao3downloadernew"))
     if any(_path_inside(cache_dir, parent) for parent in protected):
         raise BackfillError("Cache and reports must be outside the Calibre library and Git repositories")
 
@@ -3529,7 +1890,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     backup = subparsers.add_parser("backup", help="create and verify a metadata.db backup")
     _add_common_paths(backup)
-    backup.add_argument("--destination", type=Path, default=None)
+    backup.add_argument(
+        "--destination",
+        type=Path,
+        default=None,
+        help="where to write the backup (default: a new timestamped file in the cache dir)",
+    )
     backup.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
 
     columns = subparsers.add_parser("setup-columns", help="create and verify AO3 backfill custom columns")
@@ -3629,6 +1995,7 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--write-local-metrics", action="store_true")
     write.add_argument("--replace-local-metrics", action="store_true")
     write.add_argument("--approve-write", action="store_true")
+    write.add_argument("--calibre-debug", default="calibre-debug", help="calibre-debug executable")
 
     library = subparsers.add_parser("verify-library", help="verify populated values and numeric Calibre queries")
     _add_common_paths(library)
@@ -3664,11 +2031,58 @@ def _log_block(logger: logging.Logger, text: str) -> None:
         logger.info(line)
 
 
+def _new_backup_path(directory: Path, now: datetime | None = None) -> Path:
+    """Name a backup that does not exist yet; backups are never overwritten."""
+
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    candidate = directory / f"metadata.db.{stamp}.backup"
+    suffix = 2
+    while candidate.exists() or candidate.with_name(f"{candidate.name}.manifest.json").exists():
+        candidate = directory / f"metadata.db.{stamp}-{suffix}.backup"
+        suffix += 1
+    return candidate
+
+
+def _write_result_report(result: Mapping[str, object], directory: Path) -> Path:
+    """Keep the full per-book write result on disk; the terminal gets a summary."""
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"write-result-{stamp}.json"
+    write_json_atomically(path, result)
+    return path
+
+
+def _log_write_summary(logger: logging.Logger, result: Mapping[str, object], result_path: Path) -> None:
+    def count(key: str) -> int:
+        value = result.get(key)
+        return len(value) if isinstance(value, (list, dict)) else 0
+
+    written = cast(dict[str, dict[str, str]], result.get("written_values", {}))
+    logger.info(f"books updated: {count('updated')} ({sum(len(fields) for fields in written.values())} values)")
+    logger.info(f"skipped, not ok on AO3: {count('skipped_unavailable')}")
+    logger.info(f"skipped, nothing to write: {count('skipped_without_values')}")
+    logger.info(f"skipped, ambiguous: {count('skipped_ambiguous')}")
+    logger.info(f"not cached: {count('not_cached')}")
+    verification = result.get("post_write_verification")
+    if isinstance(verification, dict):
+        logger.info(
+            f"verified {verification.get('fields')} values on {verification.get('books')} books "
+            "through calibredb and SQLite"
+        )
+    if "post_write_verification_error" in result:
+        logger.error(f"verification failed: {result['post_write_verification_error']}")
+    for failure in cast(list[dict[str, object]], result.get("failed", [])):
+        logger.error(f"write failure: {failure.get('error')}")
+        logger.error(f"  completed columns: {failure.get('completed_columns')}")
+        logger.error(f"  not written: {failure.get('incomplete_columns')}")
+    logger.info(f"full result: {result_path}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run = configure_logging(args.command, log_dir=args.log_dir)
     logger = run.logger
-    logger.info(f"ao3_backfill {args.command} \u00b7 log file: {run.log_path}")
+    logger.info(f"backfill {args.command} \u00b7 log file: {run.log_path}")
 
     if args.command == "processes":
         processes = running_calibre_processes()
@@ -3684,7 +2098,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not math.isfinite(args.delay) or args.delay < MINIMUM_DELAY_SECONDS:
             raise BackfillError(f"--delay must be at least {MINIMUM_DELAY_SECONDS:g} seconds")
         cache = CacheStore(_cache_paths(args.cache_dir)[1])
-        credentials = load_ao3_credential_pair()
+        credentials = load_run_credentials()
         log_banner(
             logger,
             "AO3 authentication check",
@@ -3731,10 +2145,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "backup":
-        destination = args.destination or _cache_paths(args.cache_dir)[0].with_name(BACKUP_NAME)
+        destination = args.destination or _new_backup_path(args.cache_dir)
         _ensure_cache_location(destination.parent, args.library)
         backup_path = create_backup(args.library, destination)
         logger.info(f"Backup: {backup_path} bytes={backup_path.stat().st_size}")
+        logger.info(f'For the next write or setup-columns, pass: --backup "{backup_path}"')
         return 0
 
     if args.command == "setup-columns":
@@ -3870,29 +2285,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             include_ambiguous=args.include_ambiguous,
             write_local_metrics=args.write_local_metrics,
             replace_local_metrics=args.replace_local_metrics,
+            calibre_debug=args.calibre_debug,
         )
-        if result["failed"]:
-            try:
-                result["partial_post_write_verification"] = verify_written_values(
-                    args.calibredb,
-                    args.library,
-                    cast(dict[str, dict[str, str]], result["written_values"]),
-                )
-            except (BackfillError, RuntimeError, OSError, sqlite3.Error, ValueError) as error:
-                result["partial_post_write_verification_error"] = str(error)
-            _log_block(logger, json.dumps(result, indent=2, sort_keys=True))
-            raise BackfillError("One or more Calibre records failed; no further records were attempted")
+        written = cast(dict[str, dict[str, str]], result["written_values"])
+        logger.info("verifying written values through calibredb and read-only SQLite")
         try:
-            result["post_write_verification"] = verify_written_values(
-                args.calibredb,
-                args.library,
-                cast(dict[str, dict[str, str]], result["written_values"]),
-            )
+            result["post_write_verification"] = verify_written_values(args.calibredb, args.library, written)
         except (BackfillError, RuntimeError, OSError, sqlite3.Error, ValueError) as error:
             result["post_write_verification_error"] = str(error)
-            _log_block(logger, json.dumps(result, indent=2, sort_keys=True))
-            raise BackfillError("Post-write Calibre verification failed") from error
-        _log_block(logger, json.dumps(result, indent=2, sort_keys=True))
+        result_path = _write_result_report(result, cache_path.parent)
+        _log_write_summary(logger, result, result_path)
+        if result["failed"]:
+            raise BackfillError("The Calibre write stopped part-way; see the summary above")
+        if "post_write_verification_error" in result:
+            raise BackfillError("Post-write Calibre verification failed")
         return 0
 
     if args.command == "verify-library":
@@ -3905,12 +2311,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise BackfillError(f"Unknown command: {args.command}")
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Command-line entry point used by ``backfill.py``."""
+
     try:
         raise SystemExit(main())
     except RunInterrupted as error:
         LOGGER.warning(f"{error}; rerun the same command to resume from the cache")
         raise SystemExit(130) from error
-    except BackfillError as error:
+    except ArchiverError as error:
         LOGGER.error(str(error))
         raise SystemExit(2) from error

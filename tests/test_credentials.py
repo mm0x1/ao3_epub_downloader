@@ -1,8 +1,55 @@
+"""Tests for credential loading."""
+
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import tempfile
 import unittest
 
-import credentials
+from ao3archiver import credentials
+
+
+class BackfillCredentialLoadingTest(unittest.TestCase):
+    def test_environment_credentials_are_loaded_as_a_pair_without_output(self):
+        username = "env-user"
+        password = "env-password"
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            actual = credentials.load_run_credentials(
+                environ={"AO3_USERNAME": username, "AO3_PASSWORD": password},
+                dotenv_path=Path("/definitely-missing-ao3-backfill.env"),
+            )
+
+        self.assertEqual(actual.as_tuple(), (username, password))
+        self.assertNotIn(username, output.getvalue())
+        self.assertNotIn(password, output.getvalue())
+
+    def test_environment_credentials_reject_missing_or_partial_values_without_leaking(self):
+        for environment in ({}, {"AO3_USERNAME": "env-user"}, {"AO3_PASSWORD": "env-password"}):
+            with self.assertRaises(credentials.CredentialError) as raised:
+                credentials.load_run_credentials(
+                    environ=environment,
+                    dotenv_path=Path("/definitely-missing-ao3-backfill.env"),
+                )
+
+            self.assertNotIn("env-user", str(raised.exception))
+            self.assertNotIn("env-password", str(raised.exception))
+
+    def test_dotenv_credentials_are_loaded_without_secret_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dotenv_path = Path(directory) / ".env"
+            dotenv_path.write_text(
+                "AO3_USERNAME=env-user\nAO3_PASSWORD='env-password'\n",
+                encoding="utf-8",
+            )
+
+            actual = credentials.load_run_credentials(
+                environ={},
+                dotenv_path=dotenv_path,
+            )
+
+        self.assertEqual(actual.as_tuple(), ("env-user", "env-password"))
 
 
 class LoadDotenvTest(unittest.TestCase):
