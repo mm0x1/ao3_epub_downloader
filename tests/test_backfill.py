@@ -1,6 +1,7 @@
 """Tests for the one-time library backfill: scanning, the cache, fetching, and the Calibre write."""
 
 from contextlib import redirect_stdout
+from dataclasses import replace
 import io
 import json
 import logging
@@ -9,11 +10,12 @@ from pathlib import Path
 import tempfile
 from typing import cast
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import requests
 
-from ao3archiver import ao3_client, backfill, calibre_library
+from ao3archiver import ao3_client, backfill, calibre_library, metadata
 from ao3archiver.credentials import AO3Credentials
 from ao3archiver.run_log import configure_logging, register_secret, RunInterrupted
 from tests.support import AO3_PAGE, create_epub, FakeResponse, FakeSession, sample_report
@@ -498,6 +500,148 @@ class BackfillBulkWriteTest(unittest.TestCase):
 
         self.assertLess(len(stream.getvalue().splitlines()), 12)
         self.assertIn("books updated: 15000", stream.getvalue())
+
+
+class EnrichEpubsTest(unittest.TestCase):
+    """Baking a library book's full metadata into its EPUB file."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        root = Path(self._directory.name)
+        self.library = root / "library"
+        self.backups = root / "epub-originals"
+        self.report = multi_work_report("111", "222")
+        self.cache = backfill.CacheStore(root / "cache" / "ao3-cache.jsonl")
+        self.cache.bind(self.report)
+        self.originals = {}
+        for mapping in self.report.mappings:
+            path = self.library / mapping.epub_path
+            path.parent.mkdir(parents=True)
+            create_epub(path, f'<html><body><a href="https://archiveofourown.org/works/{mapping.work_id}">w</a></body></html>')
+            self.originals[mapping.book_id] = path.read_bytes()
+            self.cache.append(ao3_client.AO3FetchRecord(
+                work_id=mapping.work_id,
+                work_url=f"https://archiveofourown.org/works/{mapping.work_id}",
+                fetched_at="2026-01-01T00:00:00+00:00",
+                availability="ok",
+                kudos=500 + mapping.book_id,
+                hits=9000,
+            ))
+        # What Calibre holds: the AO3 values the write stage put there, plus #pages
+        # and Count Pages' exact Gfog, which the AO3 pass never sets itself.
+        self.calibre_values = {
+            mapping.book_id: {"ao3_kudos": 500 + mapping.book_id, "ao3_hits": 9000, "pages": 105,
+                              "words": 30207, "gfog": 9.23301492872045}
+            for mapping in self.report.mappings
+        }
+        self.calls = []
+
+    def tearDown(self):
+        self._directory.cleanup()
+
+    def calibre_embedder(self, pages_value=105, failures=None):
+        """Stand-in for Calibre: writes #pages the way Calibre does, in the OPF namespace."""
+
+        def embedder(_executable, library, book_ids, *, mode):
+            self.calls.append((mode, list(book_ids)))
+            if mode == "embed":
+                for mapping in self.report.mappings:
+                    if mapping.book_id in book_ids:
+                        path = library / mapping.epub_path
+                        with zipfile.ZipFile(path) as archive:
+                            entries = {item.filename: archive.read(item) for item in archive.infolist()}
+                        package = entries["content.opf"].decode("utf-8").replace(
+                            "</metadata>",
+                            '<meta name="calibre:user_metadata:#pages" content="{&quot;#value#&quot;: '
+                            f'{pages_value}, &quot;datatype&quot;: &quot;int&quot;}}"/></metadata>')
+                        entries["content.opf"] = package.encode("utf-8")
+                        with zipfile.ZipFile(path, "w") as archive:
+                            archive.writestr("mimetype", entries.pop("mimetype"), compress_type=zipfile.ZIP_STORED)
+                            for name, data in entries.items():
+                                archive.writestr(name, data)
+            return calibre_library.EmbedResult(processed=len(book_ids), failures=dict(failures or {}))
+
+        return embedder
+
+    def bake(self, embedder, **options):
+        with patch.object(backfill, "require_calibre_closed"), patch.object(backfill, "verify_backup"), \
+                patch.object(backfill, "verify_report_library"), patch.object(backfill, "verify_custom_columns"), \
+                patch.object(backfill, "verify_local_metric_columns"), patch.object(backfill, "verify_report_inputs"), \
+                patch.object(backfill, "read_all_custom_values", return_value=self.calibre_values):
+            return backfill.enrich_existing_epubs(
+                self.report, self.cache, calibredb="calibredb", library=self.library,
+                backup_path=Path("/backup"), epub_backup_dir=self.backups, limit=None,
+                embedder=embedder, **options,
+            )
+
+    def test_every_book_ends_with_calibre_and_ao3_metadata_readable_from_the_file(self):
+        result = self.bake(self.calibre_embedder())
+
+        self.assertEqual(sorted(result["enriched"]), [100, 101])
+        self.assertEqual(result["failed"], [])
+        for mapping in self.report.mappings:
+            columns = metadata.read_calibre_user_metadata(self.library / mapping.epub_path)
+            self.assertEqual(columns["pages"], 105, "a column Calibre embedded must survive the AO3 pass")
+            self.assertEqual(columns["ao3_kudos"], 500 + mapping.book_id)
+            self.assertEqual(columns["words"], 30207)
+            self.assertEqual(columns["gfog"], 9.23301492872045, "Calibre's exact value, not a rounded one")
+            self.assertTrue(metadata.has_ao3_metadata(self.library / mapping.epub_path))
+
+    def test_originals_are_backed_up_before_calibre_touches_them_and_passes_run_in_order(self):
+        self.bake(self.calibre_embedder())
+
+        for mapping in self.report.mappings:
+            self.assertEqual((self.backups / mapping.epub_path).read_bytes(), self.originals[mapping.book_id])
+        self.assertEqual([mode for mode, _ in self.calls], ["embed", "refresh-sizes"])
+
+    def test_a_rerun_keeps_the_first_backup_of_the_original(self):
+        self.bake(self.calibre_embedder())
+        self.bake(self.calibre_embedder())
+
+        for mapping in self.report.mappings:
+            self.assertEqual((self.backups / mapping.epub_path).read_bytes(), self.originals[mapping.book_id])
+
+    def test_cached_values_calibre_does_not_hold_yet_stop_before_any_change(self):
+        self.calibre_values[100]["ao3_kudos"] = 1
+
+        with self.assertRaises(backfill.BackfillError) as raised:
+            self.bake(self.calibre_embedder())
+
+        self.assertIn("backfill.py write", str(raised.exception))
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.backups.exists())
+
+    def test_an_embed_failure_stops_before_the_ao3_pass(self):
+        with self.assertRaises(backfill.BackfillError):
+            self.bake(self.calibre_embedder(failures={100: "zip error"}))
+
+        for mapping in self.report.mappings:
+            self.assertFalse(metadata.has_ao3_metadata(self.library / mapping.epub_path))
+            self.assertTrue((self.backups / mapping.epub_path).exists())
+
+    def test_a_file_that_disagrees_with_the_library_is_reported_and_stops_the_run(self):
+        result = self.bake(self.calibre_embedder(pages_value=1))
+
+        self.assertEqual(result["enriched"], [])
+        self.assertIn("#pages", result["failed"][0]["error"])
+        self.assertEqual([mode for mode, _ in self.calls], ["embed"], "no sizes to record for unbaked books")
+
+    def test_without_calibre_metadata_only_the_ao3_pass_and_size_refresh_run(self):
+        result = self.bake(self.calibre_embedder(), embed_calibre=False)
+
+        self.assertEqual(sorted(result["enriched"]), [100, 101])
+        self.assertEqual([mode for mode, _ in self.calls], ["refresh-sizes"])
+
+    def test_calibre_values_win_and_the_scan_calculation_only_fills_blanks(self):
+        mapping = replace(self.report.mappings[0], local_words=30080, local_gfog=8.45, local_metrics_calculated=True)
+        record = ao3_client.AO3FetchRecord(work_id="111", work_url="https://archiveofourown.org/works/111",
+                                           fetched_at="2026-01-01T00:00:00+00:00", availability="ok")
+
+        from_calibre = backfill._portable_metadata_for_record(mapping, record, {"words": 30207, "gfog": 9.23301492872045})
+        from_scan = backfill._portable_metadata_for_record(mapping, record, {"words": None, "gfog": ""})
+
+        self.assertEqual((from_calibre.local_words, from_calibre.local_gfog), (30207, 9.23301492872045))
+        self.assertEqual((from_scan.local_words, from_scan.local_gfog), (30080, 8.45))
 
 
 class BackupCommandTest(unittest.TestCase):

@@ -49,12 +49,16 @@ from ao3archiver.ao3_client import (
     SYSTEMIC_FETCH_ERRORS,
 )
 from ao3archiver.calibre_library import (
+    ALL_COLUMNS,
     AO3_COLUMNS,
     BulkWriteError,
     create_backup,
+    embed_calibre_metadata,
+    EmbedResult,
     load_calibre_books,
     load_local_metric_values,
     LOCAL_METRIC_COLUMNS,
+    read_all_custom_values,
     read_library_uuid,
     require_calibre_closed,
     run_calibre_bulk_write,
@@ -78,8 +82,9 @@ from ao3archiver.credentials import load_run_credentials
 from ao3archiver.metadata import (
     AO3Metadata,
     canonical_work_url,
-    enrich_epub_portable,
+    enrich_epub,
     read_ao3_metadata,
+    read_calibre_user_metadata,
     validate_epub_file,
 )
 from ao3archiver.metrics import calculate_epub_metrics, LOCAL_METRICS_ALGORITHM
@@ -1534,7 +1539,8 @@ def _optional_local_float(value: object) -> float | None:
     if isinstance(value, bool):
         raise BackfillError("Calibre local Gfog value is boolean")
     try:
-        return round(float(cast(str | int | float, value)), 2)
+        # Exactly as Calibre stores it: a baked EPUB must match the library.
+        return float(cast(str | int | float, value))
     except (TypeError, ValueError) as error:
         raise BackfillError("Calibre local Gfog value is invalid") from error
 
@@ -1544,16 +1550,18 @@ def _portable_metadata_for_record(
     record: AO3FetchRecord,
     current_local_values: dict[str, object],
 ) -> AO3Metadata:
-    local_words = (
-        mapping.local_words
-        if mapping.local_metrics_calculated
-        else _optional_local_int(current_local_values.get("words"))
-    )
-    local_gfog = (
-        mapping.local_gfog
-        if mapping.local_metrics_calculated
-        else _optional_local_float(current_local_values.get("gfog"))
-    )
+    """Metadata to bake into a library EPUB, matching what Calibre holds.
+
+    Calibre's existing Words/Gfog win, exactly as stored; the scan's own
+    calculation fills in only where Calibre's cell is blank. That is the same
+    rule the Calibre write follows, so the file and the library never disagree.
+    """
+
+    calibre_words = _optional_local_int(current_local_values.get("words"))
+    calibre_gfog = _optional_local_float(current_local_values.get("gfog"))
+    calculated = mapping.local_metrics_calculated
+    local_words = calibre_words if calibre_words is not None else (mapping.local_words if calculated else None)
+    local_gfog = calibre_gfog if calibre_gfog is not None else (mapping.local_gfog if calculated else None)
     return AO3Metadata(
         work_id=record.work_id,
         work_url=record.work_url,
@@ -1572,6 +1580,46 @@ def _portable_metadata_for_record(
     )
 
 
+EPUB_PASS_PROGRESS_EVERY = 1000
+AO3_COLUMN_LABELS = tuple(label for label, _, _, _ in AO3_COLUMNS)
+
+
+def _stale_ao3_columns(
+    candidates: Sequence[tuple[EpubMapping, AO3FetchRecord]],
+    calibre_values: Mapping[int, Mapping[str, object]],
+) -> list[tuple[int, str, object, object]]:
+    """Cached AO3 values that Calibre does not hold yet (the write has not caught up)."""
+
+    stale = []
+    for mapping, record in candidates:
+        current = calibre_values.get(mapping.book_id, {})
+        for label, _, _, attribute in AO3_COLUMNS:
+            cached = getattr(record, attribute)
+            if cached is not None and cached != "" and current.get(label) != cached:
+                stale.append((mapping.book_id, label, cached, current.get(label)))
+    return stale
+
+
+def _verify_baked_epub(
+    epub_path: Path,
+    metadata: AO3Metadata,
+    expected_columns: Mapping[str, object],
+) -> None:
+    """Prove the file now carries what the library holds, as Calibre would read it."""
+
+    stored = read_ao3_metadata(epub_path)
+    if stored.work_id != metadata.work_id or stored.work_url != metadata.work_url:
+        raise BackfillError(f"Baked EPUB has the wrong AO3 work: {epub_path}")
+    file_columns = read_calibre_user_metadata(epub_path)
+    for label, value in expected_columns.items():
+        if value is None or value == "":
+            continue
+        if file_columns.get(label) != value:
+            raise BackfillError(
+                f"Baked EPUB column #{label} is {file_columns.get(label)!r}, library has {value!r}: {epub_path}"
+            )
+
+
 def enrich_existing_epubs(
     report: ScanReport,
     cache: CacheStore,
@@ -1583,8 +1631,23 @@ def enrich_existing_epubs(
     limit: int | None = 1,
     allow_partial: bool = False,
     include_ambiguous: bool = False,
+    embed_calibre: bool = True,
+    calibre_debug: str = "calibre-debug",
+    embedder: Callable[..., EmbedResult] = embed_calibre_metadata,
 ) -> dict[str, object]:
-    """Bake namespaced portable metadata into approved existing EPUBs."""
+    """Bake each library book's full metadata into its EPUB, so the file stands alone.
+
+    Four passes, in this order because each depends on the one before:
+
+    1. back up every original EPUB (a rerun never overwrites a backup);
+    2. have Calibre write its own metadata for the book into the file, without
+       the cover: title, authors, tags, series, description, every custom column;
+    3. add the AO3 identifier, statistics block, ``ao3:*`` fields, and column
+       values on top, then check the file's columns match the library exactly;
+    4. have Calibre record the files' new sizes.
+
+    Every pass is safe to repeat, so a stopped run resumes by running it again.
+    """
 
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive when specified")
@@ -1592,80 +1655,99 @@ def enrich_existing_epubs(
     verify_backup(backup_path, library)
     verify_report_library(report, library)
     verify_custom_columns(calibredb, library)
+    verify_local_metric_columns(calibredb, library)
     validation = validate_cache(report, cache, include_ambiguous, require_binding=True)
     if validation.missing and not allow_partial:
         raise BackfillError(
             f"{len(validation.missing)} works are not cached; use --allow-partial for a reviewed batch"
         )
-    current_local_values = load_local_metric_values(calibredb, library)
-    candidates, skipped_ambiguous = _mappings_for_write(
-        report,
-        validation.records,
-        include_ambiguous,
-    )
-    candidates = [
-        (mapping, record)
-        for mapping, record in candidates
-        if record.availability == "ok"
-    ]
+    selected, skipped_ambiguous = _mappings_for_write(report, validation.records, include_ambiguous)
+    candidates: list[tuple[EpubMapping, AO3FetchRecord]] = []
+    seen_book_ids: set[int] = set()
+    for mapping, record in selected:
+        if mapping.book_id not in seen_book_ids:
+            seen_book_ids.add(mapping.book_id)
+            candidates.append((mapping, record))
     if limit is not None:
         candidates = candidates[:limit]
-    if candidates:
-        verify_report_inputs(
-            report,
-            library,
-            calibredb,
-            tuple(mapping for mapping, _ in candidates),
+    result: dict[str, object] = {
+        "enriched": [],
+        "failed": [],
+        "skipped_ambiguous": [mapping.book_id for mapping in skipped_ambiguous],
+        "not_cached": [mapping.book_id for mapping in report.mappings if mapping.work_id not in validation.records],
+        "epub_backup_dir": str(epub_backup_dir),
+    }
+    if not candidates:
+        LOGGER.info("no books to bake")
+        return result
+
+    verify_report_inputs(report, library, calibredb, tuple(mapping for mapping, _ in candidates))
+    calibre_values = read_all_custom_values(calibredb, library)
+    stale = _stale_ao3_columns(candidates, calibre_values)
+    if stale:
+        book_id, label, cached, current = stale[0]
+        raise BackfillError(
+            f"{len(stale)} cached AO3 values are not in Calibre yet (first: book {book_id} "
+            f"#{label} cached {cached!r}, Calibre has {current!r}). Run `backfill.py write` "
+            "first so the EPUBs and the library agree. Nothing has been changed."
         )
 
-    enriched: list[int] = []
-    skipped_unavailable = [
-        mapping.book_id
-        for mapping in report.mappings
-        if mapping.work_id in validation.records
-        and validation.records[mapping.work_id].availability != "ok"
-    ]
-    failed: list[dict[str, object]] = []
+    total = len(candidates)
+    LOGGER.info(f"pass 1/4: backing up {total} original EPUBs to {epub_backup_dir}")
+    for index, (mapping, _) in enumerate(candidates, start=1):
+        _backup_epub_once(library / mapping.epub_path, epub_backup_dir / mapping.epub_path)
+        if index % EPUB_PASS_PROGRESS_EVERY == 0 or index == total:
+            LOGGER.info(f"  backed up {index}/{total}")
+
+    book_ids = [mapping.book_id for mapping, _ in candidates]
+    if embed_calibre:
+        LOGGER.info(f"pass 2/4: Calibre writes its metadata into {total} EPUBs (covers left out)")
+        embedded = embedder(calibre_debug, library, book_ids, mode="embed")
+        if embedded.failures:
+            book_id, error = next(iter(embedded.failures.items()))
+            raise BackfillError(
+                f"Calibre could not embed metadata for {len(embedded.failures)} books (first: book "
+                f"{book_id}: {error}). The originals are backed up in {epub_backup_dir}; the AO3 pass "
+                "did not run."
+            )
+    else:
+        LOGGER.info("pass 2/4: skipped (--no-calibre-metadata)")
+
+    LOGGER.info("pass 3/4: adding AO3 metadata and checking each file against the library")
+    enriched = cast(list[int], result["enriched"])
+    failed = cast(list[dict[str, object]], result["failed"])
     for mapping, record in candidates:
         epub_path = library / mapping.epub_path
-        backup_epub_path = epub_backup_dir / mapping.epub_path
+        current = calibre_values.get(mapping.book_id, {})
         try:
-            _backup_epub_once(epub_path, backup_epub_path)
-            metadata = _portable_metadata_for_record(
-                mapping,
-                record,
-                current_local_values.get(mapping.book_id, {}),
-            )
-            enrich_epub_portable(epub_path, metadata)
+            metadata = _portable_metadata_for_record(mapping, record, current)
+            enrich_epub(epub_path, metadata, calibre_columns=ALL_COLUMNS)
             validate_epub_file(epub_path)
-            stored = read_ao3_metadata(epub_path)
-            if stored.work_id != metadata.work_id or stored.work_url != metadata.work_url:
-                raise BackfillError(f"Portable EPUB metadata identity mismatch: {epub_path}")
-            if metadata.category is not None and stored.category != metadata.category:
-                raise BackfillError(f"Portable EPUB category verification failed: {epub_path}")
-            if metadata.local_words is not None and stored.local_words != metadata.local_words:
-                raise BackfillError(f"Portable EPUB local Words verification failed: {epub_path}")
-            if metadata.local_gfog is not None and stored.local_gfog != metadata.local_gfog:
-                raise BackfillError(f"Portable EPUB Gfog verification failed: {epub_path}")
-            enriched.append(mapping.book_id)
+            expected = dict(current) if embed_calibre else {}
+            for label, _, _, attribute in ALL_COLUMNS:
+                if getattr(metadata, attribute) is not None:
+                    expected[label] = getattr(metadata, attribute)
+            _verify_baked_epub(epub_path, metadata, expected)
         except (BackfillError, OSError, ValueError, ET.ParseError, zipfile.BadZipFile) as error:
-            failed.append(
-                {
-                    "book_id": mapping.book_id,
-                    "work_id": mapping.work_id,
-                    "epub_path": mapping.epub_path,
-                    "error": str(error),
-                }
-            )
+            failed.append({
+                "book_id": mapping.book_id,
+                "work_id": mapping.work_id,
+                "epub_path": mapping.epub_path,
+                "error": str(error),
+            })
+            LOGGER.error(f"book {mapping.book_id}: {error}; stopping (original backed up in {epub_backup_dir})")
             break
+        enriched.append(mapping.book_id)
+        if len(enriched) % EPUB_PASS_PROGRESS_EVERY == 0 or len(enriched) == total:
+            LOGGER.info(f"  baked {len(enriched)}/{total}")
 
-    return {
-        "enriched": enriched,
-        "skipped_ambiguous": [mapping.book_id for mapping in skipped_ambiguous],
-        "skipped_unavailable": skipped_unavailable,
-        "not_cached": [mapping.book_id for mapping in report.mappings if mapping.work_id not in validation.records],
-        "failed": failed,
-    }
+    if enriched:
+        LOGGER.info(f"pass 4/4: recording the new sizes of {len(enriched)} EPUBs in Calibre")
+        sized = embedder(calibre_debug, library, enriched, mode="refresh-sizes")
+        if sized.failures:
+            failed.append({"error": f"Calibre could not record new sizes for {len(sized.failures)} books",
+                           "book_ids": sorted(sized.failures)})
+    return result
 
 
 def write_calibre_values(
@@ -1917,7 +1999,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     enrich = subparsers.add_parser(
         "enrich-epubs",
-        help="bake portable AO3/local metadata into approved existing EPUBs",
+        help="bake each library book's full metadata (Calibre's and AO3's) into its EPUB file",
     )
     _add_common_paths(enrich)
     enrich.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -1928,6 +2010,12 @@ def build_parser() -> argparse.ArgumentParser:
     enrich.add_argument("--allow-partial", action="store_true")
     enrich.add_argument("--include-ambiguous", action="store_true")
     enrich.add_argument("--approve-epub-write", action="store_true")
+    enrich.add_argument(
+        "--no-calibre-metadata",
+        action="store_true",
+        help="add only the AO3 metadata; do not write Calibre's own title, tags, series, etc. into the files",
+    )
+    enrich.add_argument("--calibre-debug", default="calibre-debug", help="calibre-debug executable")
 
     fetch = subparsers.add_parser("fetch", help="fetch current AO3 metadata into the JSONL cache")
     _add_common_paths(fetch)
@@ -2194,10 +2282,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             allow_partial=args.allow_partial,
             include_ambiguous=args.include_ambiguous,
+            embed_calibre=not args.no_calibre_metadata,
+            calibre_debug=args.calibre_debug,
         )
-        _log_block(logger, json.dumps(result, indent=2, sort_keys=True))
+        result_path = _write_result_report(result, cache_path.parent)
+        logger.info(f"books baked: {len(cast(list[int], result['enriched']))}")
+        logger.info(f"skipped, ambiguous: {len(cast(list[int], result['skipped_ambiguous']))}")
+        logger.info(f"not cached: {len(cast(list[int], result['not_cached']))}")
+        logger.info(f"original EPUBs backed up in: {result['epub_backup_dir']}")
+        logger.info(f"full result: {result_path}")
         if result["failed"]:
-            raise BackfillError("One or more EPUB enrichments failed; no further records were attempted")
+            for failure in cast(list[dict[str, object]], result["failed"]):
+                logger.error(f"failure: {failure}")
+            raise BackfillError("EPUB baking stopped part-way; rerun the same command after fixing the cause")
         return 0
 
     if args.command == "fetch":

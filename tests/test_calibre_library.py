@@ -7,10 +7,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
+import sqlite3
 import unittest
 from unittest.mock import patch
 
-from ao3archiver import calibre_library
+from ao3archiver import calibre_library, metadata
 from tests.support import create_epub
 
 
@@ -202,6 +204,69 @@ class CalibreProcessDetectionTest(unittest.TestCase):
 
     def test_the_live_process_table_can_be_read(self):
         self.assertTrue(calibre_library._proc_command_lines())
+
+
+class CalibreScriptRunnerTest(unittest.TestCase):
+    def test_a_lot_of_stderr_cannot_hang_the_runner(self):
+        """stderr used to be a pipe read only after stdout ended; a full pipe deadlocked both."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "chatty-calibre-debug"
+            script.write_text(
+                f"#!{sys.executable}\nimport sys\n"
+                "sys.stderr.write('warning: something about a book\\n' * 20000)\n"
+                "print('{\"event\": \"progress\", \"done\": 1, \"total\": 1}', flush=True)\n"
+                "print('{\"event\": \"done\", \"processed\": 1}', flush=True)\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+            events = []
+
+            ok, _ = calibre_library._run_calibre_script(str(script), Path("/unused.py"), {}, events.append)
+
+        self.assertTrue(ok)
+        self.assertEqual([event["event"] for event in events], ["progress", "done"])
+
+
+@unittest.skipUnless(shutil.which("calibre-debug") and shutil.which("calibredb"), "Calibre is not installed")
+class CalibreEmbedIntegrationTest(unittest.TestCase):
+    """Runs calibre_scripts/embed_metadata.py under the real calibre-debug."""
+
+    def test_calibre_metadata_is_embedded_without_the_cover_and_sizes_are_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "library"
+            library.mkdir()
+            epub = Path(directory) / "work.epub"
+            create_epub(epub, "<html><body>preface</body></html>")
+            env = calibre_library.sanitized_child_environment()
+            run = lambda *arguments: subprocess.run(
+                ["calibredb", "--library-path", str(library), *arguments], check=True, capture_output=True, env=env
+            )
+            run("add_custom_column", "pages", "Pages", "int")
+            run("add", str(epub))
+            run("set_custom", "pages", "1", "105")
+
+            result = calibre_library.embed_calibre_metadata("calibre-debug", library, [1], mode="embed")
+            with sqlite3.connect(library / "metadata.db") as connection:
+                relative, = connection.execute("select path from books where id = 1").fetchone()
+                recorded, = connection.execute("select uncompressed_size from data where book = 1").fetchone()
+            book = next((library / relative).glob("*.epub"))
+            with zipfile.ZipFile(book) as archive:
+                images = [name for name in archive.namelist() if name.lower().endswith((".jpg", ".jpeg", ".png"))]
+            columns = metadata.read_calibre_user_metadata(book)
+            size_after_embed = book.stat().st_size
+
+            with book.open("ab") as stream:
+                stream.write(b"\0")
+            calibre_library.embed_calibre_metadata("calibre-debug", library, [1], mode="refresh-sizes")
+            with sqlite3.connect(library / "metadata.db") as connection:
+                refreshed, = connection.execute("select uncompressed_size from data where book = 1").fetchone()
+
+        self.assertEqual((result.processed, result.failures), (1, {}))
+        self.assertEqual(columns.get("pages"), 105)
+        self.assertEqual(images, [], "no cover image is embedded")
+        self.assertEqual(recorded, size_after_embed)
+        self.assertEqual(refreshed, size_after_embed + 1)
 
 
 class CalibredbEnvironmentTest(unittest.TestCase):

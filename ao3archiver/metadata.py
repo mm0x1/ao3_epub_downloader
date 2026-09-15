@@ -14,6 +14,7 @@ import stat
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from xml.parsers import expat
 
 DC_NS = "http://purl.org/dc/elements/1.1/"
 OPF_NS = "http://www.idpf.org/2007/opf"
@@ -289,13 +290,12 @@ def _set_plain_meta_value(metadata: ET.Element, name: str, value: str) -> None:
     declared its namespaces, so these metas are written unqualified.
     """
 
-    matches = list(_metadata_children(metadata, name))
-    existing = matches[0] if matches else None
-    if existing is None:
-        existing = ET.SubElement(metadata, "meta", {"name": name})
-    for duplicate in matches[1:]:
-        metadata.remove(duplicate)
-    existing.set("content", value)
+    # Never reuse an existing element: one written by Calibre itself (for example
+    # by `calibredb embed_metadata`) is parsed in the OPF namespace, so updating
+    # it in place would serialise it as <opf:meta> and Calibre would ignore it.
+    for existing in list(_metadata_children(metadata, name)):
+        metadata.remove(existing)
+    ET.SubElement(metadata, "meta", {"name": name, "content": value})
 
 
 def _remove_meta_value(metadata: ET.Element, name: str) -> None:
@@ -349,7 +349,8 @@ def _format_statistics(metadata: AO3Metadata) -> str:
         ("Gunning Fog", metadata.local_gfog),
     ]
     lines = [
-        f"{label}: {escape(str(value))}"
+        # Floats are rounded for reading only; the column value stays exact.
+        f"{label}: {escape(f'{value:.2f}' if isinstance(value, float) else str(value))}"
         for label, value in values
         if value is not None
     ]
@@ -441,7 +442,30 @@ def _calibre_user_metadata(
     return values
 
 
+def _unqualify_calibre_user_metadata(package: ET.Element) -> None:
+    """Keep every Calibre custom-column entry readable by Calibre's importer.
+
+    ElementTree writes OPF-namespace elements as ``<opf:meta>``, and Calibre's
+    user-metadata reader only matches an unprefixed ``<meta>``. Other Calibre
+    metas tolerate the prefix. Normalising here, where every rewrite passes,
+    covers entries this project never set, such as ``#pages`` embedded by
+    Calibre itself, which otherwise vanished on import.
+    """
+
+    for container in package:
+        if _local_name(container.tag) != "metadata":
+            continue
+        for child in container:
+            if (
+                _local_name(child.tag) == "meta"
+                and child.tag != "meta"
+                and child.attrib.get("name", "").startswith("calibre:user_metadata:")
+            ):
+                child.tag = "meta"
+
+
 def _serialize_package(package: ET.Element) -> bytes:
+    _unqualify_calibre_user_metadata(package)
     ET.register_namespace("", OPF_NS)
     ET.register_namespace("dc", DC_NS)
     ET.register_namespace("opf", OPF_NS)
@@ -622,25 +646,50 @@ def read_ao3_metadata(epub_path: str | Path) -> AO3Metadata:
     )
 
 
-def has_calibre_user_metadata(epub_path: str | Path) -> bool:
-    """Return whether an EPUB carries Calibre custom-column values Calibre can read.
+def _calibre_readable_user_metadata(epub_path: str | Path) -> dict[str, object]:
+    """Return ``{label: parsed content}`` for every custom-column entry Calibre would import.
 
-    Mirrors Calibre's own reader, which only matches an unprefixed ``<meta>``.
+    Calibre matches ``//*[name() = "meta" and starts-with(@name, "calibre:user_metadata:")]``,
+    so ``<meta>`` counts whether or not a default namespace applies, but ``<opf:meta>`` never
+    does. ElementTree drops prefixes, so the package is read without namespace processing to
+    see names exactly as written.
     """
 
+    with zipfile.ZipFile(epub_path, "r") as archive:
+        container = ET.fromstring(archive.read("META-INF/container.xml"))
+        package = archive.read(_find_rootfile(container))
+    entries: dict[str, object] = {}
+
+    def start_element(tag: str, attributes: dict[str, str]) -> None:
+        name = attributes.get("name", "")
+        if tag != "meta" or not name.startswith("calibre:user_metadata:#"):
+            return
+        try:
+            payload = json.loads(attributes.get("content", ""))
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            entries[name.split(":#", 1)[1]] = payload
+
+    parser = expat.ParserCreate()
+    parser.StartElementHandler = start_element
+    parser.Parse(package, True)
+    return entries
+
+
+def read_calibre_user_metadata(epub_path: str | Path) -> dict[str, object]:
+    """Return ``{label: value}`` for the custom columns Calibre would import from an EPUB."""
+
+    return {label: payload.get("#value#") for label, payload in _calibre_readable_user_metadata(epub_path).items()}
+
+
+def has_calibre_user_metadata(epub_path: str | Path) -> bool:
+    """Return whether an EPUB carries Calibre custom-column values Calibre can read."""
+
     try:
-        with zipfile.ZipFile(epub_path, "r") as archive:
-            container = ET.fromstring(archive.read("META-INF/container.xml"))
-            package = ET.fromstring(archive.read(_find_rootfile(container)))
-        metadata = _find_metadata_element(package)
-    except (KeyError, ValueError, OSError, zipfile.BadZipFile, ET.ParseError):
+        return bool(_calibre_readable_user_metadata(epub_path))
+    except (KeyError, ValueError, OSError, zipfile.BadZipFile, ET.ParseError, expat.ExpatError):
         return False
-    return any(
-        child.tag == "meta"
-        and child.attrib.get("name", "").startswith("calibre:user_metadata:#")
-        and child.attrib.get("content")
-        for child in metadata
-    )
 
 
 def has_ao3_metadata(epub_path: str | Path) -> bool:

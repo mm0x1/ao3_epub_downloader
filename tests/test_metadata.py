@@ -17,6 +17,8 @@ from ao3archiver.metadata import (
     metadata_from_csv_row,
     parse_ao3_metadata,
     read_ao3_metadata,
+    has_calibre_user_metadata,
+    read_calibre_user_metadata,
     validate_epub_file,
 )
 
@@ -231,6 +233,58 @@ class OmittedZeroCountsTest(unittest.TestCase):
         self.assertIsNone(metadata.comments)
 
 
+class StatisticsBlockTest(unittest.TestCase):
+    def test_floats_are_rounded_for_reading_while_the_column_keeps_the_exact_value(self):
+        exact = 12.317393179326084
+        item = AO3Metadata("64805", "https://archiveofourown.org/works/64805", local_gfog=exact)
+
+        with tempfile.TemporaryDirectory() as directory:
+            epub_path = f"{directory}/work.epub"
+            create_epub(epub_path)
+            enrich_epub(epub_path, item, calibre_columns=(("gfog", "Gfog", "float", "local_gfog"),))
+            with zipfile.ZipFile(epub_path) as archive:
+                content = archive.read("content.opf").decode("utf-8")
+
+            columns = read_calibre_user_metadata(epub_path)
+
+        self.assertIn("Gunning Fog: 12.32&lt;", content)
+        self.assertEqual(columns["gfog"], exact)
+
+    def test_prefixed_column_entries_are_not_counted_as_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            epub_path = f"{directory}/work.epub"
+            create_epub(epub_path)
+            with zipfile.ZipFile(epub_path) as archive:
+                package = archive.read("content.opf").decode("utf-8")
+            package = package.replace(
+                "</metadata>",
+                '<opf:meta xmlns:opf="http://www.idpf.org/2007/opf" name="calibre:user_metadata:#pages" '
+                'content="{&quot;#value#&quot;: 5}"/></metadata>')
+            rewritten = f"{directory}/rewritten.epub"
+            with zipfile.ZipFile(epub_path) as source, zipfile.ZipFile(rewritten, "w") as target:
+                for entry in source.infolist():
+                    target.writestr(entry, package.encode("utf-8") if entry.filename == "content.opf" else source.read(entry))
+
+            self.assertEqual(read_calibre_user_metadata(rewritten), {})
+
+    def test_entries_calibre_writes_under_a_default_namespace_are_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            epub_path = f"{directory}/work.epub"
+            create_epub(epub_path)
+            with zipfile.ZipFile(epub_path) as archive:
+                package = archive.read("content.opf").decode("utf-8")
+            package = package.replace(
+                "</metadata>",
+                '<meta name="calibre:user_metadata:#pages" content="{&quot;#value#&quot;: 5}"/></metadata>')
+            rewritten = f"{directory}/rewritten.epub"
+            with zipfile.ZipFile(epub_path) as source, zipfile.ZipFile(rewritten, "w") as target:
+                for entry in source.infolist():
+                    target.writestr(entry, package.encode("utf-8") if entry.filename == "content.opf" else source.read(entry))
+
+            self.assertEqual(read_calibre_user_metadata(rewritten), {"pages": 5})
+            self.assertTrue(has_calibre_user_metadata(rewritten))
+
+
 class CalibreUserMetadataTest(unittest.TestCase):
     """Guard the exact contract Calibre's importer requires."""
 
@@ -315,6 +369,74 @@ class CalibreUserMetadataTest(unittest.TestCase):
 
         self.assertNotIn("calibre:user_metadata", content)
         self.assertIn("ao3:kudos", content)
+
+    def test_a_column_calibre_already_embedded_is_rewritten_unprefixed(self):
+        """calibredb embed_metadata writes these in the OPF namespace; reusing them made <opf:meta>."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            epub_path = f"{directory}/work.epub"
+            create_epub(epub_path)
+            with zipfile.ZipFile(epub_path) as archive:
+                package = archive.read("content.opf").decode("utf-8")
+            calibre_written = (
+                '<meta name="calibre:user_metadata:#ao3_kudos" '
+                'content="{&quot;#value#&quot;: 1, &quot;datatype&quot;: &quot;int&quot;}"/>'
+            )
+            package = package.replace("</metadata>", calibre_written + "</metadata>")
+            rewritten = f"{directory}/rewritten.epub"
+            with zipfile.ZipFile(epub_path) as source, zipfile.ZipFile(rewritten, "w") as target:
+                for item in source.infolist():
+                    data = package.encode("utf-8") if item.filename == "content.opf" else source.read(item)
+                    target.writestr(item, data)
+
+            enrich_epub(rewritten, self.metadata(), calibre_columns=self.COLUMNS)
+
+            with zipfile.ZipFile(rewritten) as archive:
+                content = archive.read("content.opf").decode("utf-8")
+                package_element = ET.fromstring(archive.read("content.opf"))
+
+        metadata_element = next(
+            child for child in package_element if child.tag.rsplit("}", 1)[-1] == "metadata"
+        )
+        kudos = [
+            child for child in metadata_element
+            if child.attrib.get("name") == "calibre:user_metadata:#ao3_kudos"
+        ]
+        self.assertEqual(len(kudos), 1)
+        self.assertEqual(kudos[0].tag, "meta", "Calibre ignores <opf:meta>")
+        self.assertEqual(json.loads(kudos[0].attrib["content"])["#value#"], 68)
+        self.assertNotIn("<opf:meta name=\"calibre:user_metadata", content)
+
+    def test_columns_this_project_does_not_set_also_stay_readable_by_calibre(self):
+        """#pages embedded by Calibre used to come out as <opf:meta> and vanish on import."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            epub_path = f"{directory}/work.epub"
+            create_epub(epub_path)
+            with zipfile.ZipFile(epub_path) as archive:
+                package = archive.read("content.opf").decode("utf-8")
+            package = package.replace(
+                "</metadata>",
+                '<meta name="calibre:user_metadata:#pages" '
+                'content="{&quot;#value#&quot;: 105, &quot;datatype&quot;: &quot;int&quot;}"/></metadata>',
+            )
+            rewritten = f"{directory}/rewritten.epub"
+            with zipfile.ZipFile(epub_path) as source, zipfile.ZipFile(rewritten, "w") as target:
+                for item in source.infolist():
+                    data = package.encode("utf-8") if item.filename == "content.opf" else source.read(item)
+                    target.writestr(item, data)
+
+            for enrich in (
+                lambda path: enrich_epub(path, self.metadata(), calibre_columns=self.COLUMNS),
+                lambda path: enrich_epub_portable(path, self.metadata()),
+            ):
+                enrich(rewritten)
+                with zipfile.ZipFile(rewritten) as archive:
+                    element = ET.fromstring(archive.read("content.opf"))
+                metadata_element = next(c for c in element if c.tag.rsplit("}", 1)[-1] == "metadata")
+                pages = [c for c in metadata_element if c.attrib.get("name") == "calibre:user_metadata:#pages"]
+                self.assertEqual([c.tag for c in pages], ["meta"])
+                self.assertEqual(json.loads(pages[0].attrib["content"])["#value#"], 105)
 
     def test_re_enrichment_replaces_rather_than_duplicates_a_column(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -551,6 +552,55 @@ class BulkWriteError(CalibreLibraryError):
         self.completed = tuple(completed)
 
 
+EMBED_METADATA_SCRIPT = Path(__file__).with_name("calibre_scripts") / "embed_metadata.py"
+
+
+def _run_calibre_script(
+    calibre_debug: str,
+    script: Path,
+    payload: Mapping[str, object],
+    on_event: Callable[[dict[str, object]], None],
+) -> tuple[bool, str]:
+    """Run a ``calibre_scripts`` helper under calibre-debug, passing on its JSON events.
+
+    Returns whether it finished cleanly, and the tail of its stderr for errors.
+    Raises OSError if calibre-debug cannot be started.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="ao3-calibre-") as directory:
+        payload_path = Path(directory) / "payload.json"
+        payload_path.write_text(json.dumps(payload), encoding="utf-8")
+        # stderr goes to a file, not a pipe: Calibre can print a warning per
+        # book, and a full stderr pipe would block both processes forever.
+        stderr_path = Path(directory) / "stderr.txt"
+        with stderr_path.open("w", encoding="utf-8") as stderr_file:
+            process = subprocess.Popen(
+                [calibre_debug, str(script), "--", str(payload_path)],
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                text=True,
+                env=sanitized_child_environment(),
+            )
+            finished = False
+            assert process.stdout is not None
+            for line in process.stdout:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # calibre-debug and its plugins may print their own chatter.
+                    LOGGER.debug(f"calibre-debug: {line.rstrip()}")
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") == "done":
+                    finished = True
+                on_event(event)
+            returncode = process.wait()
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+    detail = " ".join(stderr.strip().splitlines()[-3:]) or f"exit status {returncode}"
+    return finished and returncode == 0, detail
+
+
 def run_calibre_bulk_write(
     calibre_debug: str,
     library: Path,
@@ -560,58 +610,88 @@ def run_calibre_bulk_write(
     """Write every planned column through Calibre's API and return the columns written."""
 
     completed: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="ao3-calibre-write-") as directory:
-        payload_path = Path(directory) / "payload.json"
-        payload = {
-            "library": str(library),
-            "columns": {
-                label: {
-                    "datatype": datatypes[label],
-                    "values": {str(book_id): value for book_id, value in values.items()},
-                }
-                for label, values in plan.items()
-            },
-        }
-        payload_path.write_text(json.dumps(payload), encoding="utf-8")
-        try:
-            process = subprocess.Popen(
-                [calibre_debug, str(BULK_WRITE_SCRIPT), "--", str(payload_path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=sanitized_child_environment(),
+
+    def on_event(event: dict[str, object]) -> None:
+        if event.get("event") == "column":
+            label = str(event.get("label"))
+            completed.append(label)
+            LOGGER.info(
+                f"  #{label}: {event.get('requested')} values set, "
+                f"{event.get('changed')} changed ({event.get('seconds')}s)"
             )
-        except OSError as error:
-            raise BulkWriteError(f"Could not start {calibre_debug}: {error}", completed) from error
-        finished = False
-        assert process.stdout is not None
-        for line in process.stdout:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                # calibre-debug and its plugins may print their own chatter.
-                LOGGER.debug(f"calibre-debug: {line.rstrip()}")
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("event") == "column":
-                label = str(event.get("label"))
-                completed.append(label)
-                LOGGER.info(
-                    f"  #{label}: {event.get('requested')} values set, "
-                    f"{event.get('changed')} changed ({event.get('seconds')}s)"
-                )
-            elif event.get("event") == "done":
-                finished = True
-        stderr = process.stderr.read() if process.stderr is not None else ""
-        returncode = process.wait()
-    if returncode != 0 or not finished:
-        detail = " ".join(stderr.strip().splitlines()[-3:]) or f"exit status {returncode}"
+
+    payload = {
+        "library": str(library),
+        "columns": {
+            label: {
+                "datatype": datatypes[label],
+                "values": {str(book_id): value for book_id, value in values.items()},
+            }
+            for label, values in plan.items()
+        },
+    }
+    try:
+        ok, detail = _run_calibre_script(calibre_debug, BULK_WRITE_SCRIPT, payload, on_event)
+    except OSError as error:
+        raise BulkWriteError(f"Could not start {calibre_debug}: {error}", completed) from error
+    if not ok:
         raise BulkWriteError(
             f"Calibre API write stopped after {len(completed)} of {len(plan)} columns: {detail}",
             completed,
         )
     return tuple(completed)
+
+
+@dataclass(frozen=True)
+class EmbedResult:
+    """What calibre_scripts/embed_metadata.py reported."""
+
+    processed: int
+    failures: dict[int, str]
+
+
+def embed_calibre_metadata(
+    calibre_debug: str,
+    library: Path,
+    book_ids: Sequence[int],
+    *,
+    mode: str = "embed",
+) -> EmbedResult:
+    """Have Calibre write each book's metadata into its EPUB (no cover), or just record sizes.
+
+    ``mode="embed"`` matches ``calibredb embed_metadata`` without the cover image;
+    ``mode="refresh-sizes"`` records the EPUBs' current sizes in the library.
+    """
+
+    failures: dict[int, str] = {}
+    processed = 0
+    verb = "embedded" if mode == "embed" else "sized"
+
+    def on_event(event: dict[str, object]) -> None:
+        nonlocal processed
+        kind = event.get("event")
+        if kind == "book_error":
+            failures[int(cast(int, event.get("book_id")))] = str(event.get("error"))
+        elif kind == "progress":
+            LOGGER.info(f"  {verb} {event.get('done')}/{event.get('total')} books")
+        elif kind == "done":
+            processed = int(cast(int, event.get("processed", 0)))
+
+    payload = {"library": str(library), "book_ids": list(book_ids), "mode": mode}
+    try:
+        ok, detail = _run_calibre_script(calibre_debug, EMBED_METADATA_SCRIPT, payload, on_event)
+    except OSError as error:
+        raise CalibreLibraryError(f"Could not start {calibre_debug}: {error}") from error
+    if not ok:
+        raise CalibreLibraryError(f"Calibre stopped part-way ({mode}): {detail}")
+    return EmbedResult(processed=processed, failures=failures)
+
+
+def read_all_custom_values(calibredb: str, library: Path) -> dict[int, dict[str, object]]:
+    """Every custom column's value for every book, as Calibre reports it."""
+
+    labels = tuple(read_custom_columns_sqlite(library))
+    return _read_custom_values_calibredb(calibredb, library, labels) if labels else {}
 
 
 def verify_library_values(calibredb: str, library: Path) -> dict[str, object]:

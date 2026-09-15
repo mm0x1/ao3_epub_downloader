@@ -29,7 +29,8 @@ past AO3's Cloudflare protection.
    no sync step.
 
 For a library that already holds thousands of AO3 EPUBs, `backfill.py` fills
-the same columns in place, once.
+the same columns in place, once, and then bakes each book's full metadata into
+its EPUB file.
 
 ## Setup
 
@@ -185,12 +186,16 @@ the work page and written into the file in three forms:
 Nothing is written for a value AO3 does not show, so a missing statistic never
 blanks a column.
 
+Books in an existing library can carry all of Calibre's metadata as well; see
+[step 6 of the backfill](#backfilling-an-existing-calibre-library).
+
 ## Backfilling an existing Calibre library
 
-`backfill.py` fills the same columns for EPUBs already in a Calibre library. It
-is a one-time job. It never rewrites EPUBs, `metadata.opf` files, tags,
-identifiers, or other standard metadata. Every stage that talks to AO3 or
-changes the library needs an explicit `--approve-…` flag.
+`backfill.py` fills the same columns for EPUBs already in a Calibre library,
+then makes each EPUB self-contained. It is a one-time job. Steps 1–5 change only
+Calibre's custom columns; step 6 rewrites the EPUB files, after backing up every
+original. Every stage that talks to AO3 or changes the library needs an explicit
+`--approve-…` flag.
 
 Close Calibre and Calibre-Web first. The commands that change the library check
 this and refuse to run otherwise.
@@ -286,15 +291,49 @@ python3 backfill.py verify-library --library "/path/to/Calibre Library"
 - Calibre refreshes each book's `metadata.opf` the next time it opens the
   library, just as it does after any `calibredb` edit.
 
-**Optional: portable EPUB metadata.** `enrich-epubs` writes the `ao3:*` metadata
-into the library's EPUB files themselves, backing up each original first:
+**6. Bake the metadata into the EPUBs.** Until now the values live only in
+Calibre's database. `enrich-epubs` writes each book's complete metadata into its
+EPUB file, so the file alone carries everything and can be imported into another
+Calibre library, or any other reader, with nothing lost:
+
+- Calibre's own metadata: title, authors, tags, series, rating, publisher,
+  publication date, languages, description, and every custom column, including
+  ones this project does not manage, such as `#pages`. **Covers are not
+  embedded**; they stay in each book folder's `cover.jpg`.
+- The AO3 identifier, `ao3:*` fields, and statistics block described
+  [above](#what-goes-into-each-epub).
+
+As with the write, take a backup and bake one book first:
 
 ```sh
+python3 backfill.py backup --library "/path/to/Calibre Library"
 python3 backfill.py enrich-epubs --library "/path/to/Calibre Library" \
   --backup "<path printed by backup>" \
   --epub-backup-dir ~/.local/share/ao3-calibre-backfill/epub-originals \
   --approve-epub-write --limit 1
 ```
+
+Check that book, then take a fresh backup and bake the rest with
+`--limit 20000`. The run works in four passes:
+
+1. copies every original EPUB into `--epub-backup-dir` (a rerun never
+   overwrites a copy);
+2. has Calibre write its metadata into the files, through its own API, without
+   the cover;
+3. adds the AO3 metadata and reads every file back, stopping at the first one
+   whose columns differ from the library;
+4. has Calibre record the files' new sizes.
+
+- On a 14,800-book library this took about 7½ minutes and added about 1 KB per
+  book. The copies of the originals take as much space as the EPUBs themselves.
+- It refuses to start if the cache holds AO3 values that Calibre does not have
+  yet; run `write` first. Where Calibre has a `#words` or `#gfog` value, that
+  value goes into the file exactly; a calculated value is used only for a blank
+  cell.
+- A stopped run resumes by running the same command again (after a new backup).
+- `--no-calibre-metadata` skips pass 2 and adds only the AO3 metadata.
+- EPUBs with no AO3 link, and those whose preface links several works (unless
+  `--include-ambiguous`), are left alone.
 
 Run `python3 backfill.py <command> --help` for every option.
 
@@ -312,7 +351,8 @@ nothing personal ends up in the repository:
 | `ao3-cache.jsonl.failures.jsonl` | Works the backfill could not fetch. |
 | `ao3-cache.jsonl.fetch.lock` | Held by whichever AO3 run is active. |
 | `metadata.db.<timestamp>.backup` | Verified `metadata.db` backups, each with a checksum manifest. Never overwritten. |
-| `write-result-*.json` | Per-book results of each Calibre write. |
+| `write-result-*.json` | Per-book results of each Calibre write and EPUB bake. |
+| `epub-originals/` | The EPUBs as they were before `enrich-epubs`, when passed as `--epub-backup-dir`. |
 
 ## Project layout
 
@@ -324,9 +364,10 @@ ao3archiver/
                             page classification, EPUB downloads, run lock, work queue
   download.py               the download workflow
   backfill.py               the backfill workflow
-  calibre_library.py        columns, calibredb, backups, the bulk writer, verification
+  calibre_library.py        columns, calibredb, backups, the Calibre scripts, verification
   calibre_scripts/
-    bulk_write.py           runs under calibre-debug; kept apart from the package
+    bulk_write.py           run under calibre-debug, kept apart from the package:
+    embed_metadata.py       column writes, and cover-free metadata embedding
   metadata.py               AO3 page statistics and EPUB metadata
   metrics.py                local Words and Gunning Fog
   credentials.py            .env / environment / personal.ini
@@ -342,6 +383,6 @@ python3 -m pip install pytest
 python3 -m pytest
 ```
 
-The suite runs offline against a fake AO3. Two integration tests also exercise
+The suite runs offline against a fake AO3. A few integration tests also exercise
 the real `calibre-debug` and `calibredb`, and are skipped when Calibre is not
 installed.
